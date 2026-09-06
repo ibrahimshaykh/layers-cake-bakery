@@ -17,26 +17,28 @@ export const nav = [
 
 export const hero = {
   eyebrow: "Baked in layers, since day one",
+  // Headings are deliberately short: the cake floats in front of them, so a
+  // long line would be unreadable behind it.
   checkpoints: [
     {
-      progress: 0.02,
-      heading: "Every cake starts with a single layer.",
-      body: "",
+      progress: 0,
+      heading: "Built in layers.",
+      body: "Six layers of sponge and cream, stacked by hand every morning.",
     },
     {
       progress: 0.28,
-      heading: "Layer by layer.",
-      body: "Sponge, cream, sponge, cream — built by hand, never rushed.",
+      heading: "Cut fresh.",
+      body: "Sliced to order, never portioned the night before.",
     },
     {
       progress: 0.55,
-      heading: "Baked fresh, every morning.",
-      body: "No shortcuts, no fillers. Just butter, cocoa, and time.",
+      heading: "Every layer shows.",
+      body: "No fillers, no shortcuts. Just butter, cocoa, and time.",
     },
     {
       progress: 0.8,
-      heading: "One slice tells the whole story.",
-      body: "You can see every layer we put into it.",
+      heading: "Made to be shared.",
+      body: "Boxed warm and ready the same day you pick it up.",
     },
   ],
   ctaLabel: "See the menu",

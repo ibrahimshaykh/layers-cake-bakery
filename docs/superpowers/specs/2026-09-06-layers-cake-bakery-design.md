@@ -16,21 +16,44 @@ to create a sense of depth, modeled on https://remix-of-cccc.vercel.app/.
   24fps, 10s, 240 frames (H.264), generated via Google Flow per the user.
 
 ## Mechanism
-1. At build time, extract 150 evenly-sampled frames from the source video
-   via ffmpeg (`ffmpeg-static`/`ffprobe-static` npm packages, no system
-   ffmpeg dependency), resized to ~1280px wide, encoded as WebP
-   (~q75), written to `public/frames/frame-XXX.webp`.
+1. At build time, `scripts/extract-frames.mjs` turns the source video into
+   150 transparent WebP frames in `public/frames/` (ffmpeg-static, no
+   system ffmpeg dependency). Two things it works around:
+   - **Framing.** The camera pushes in for the whole take; past ~4.4s the
+     cake's base is cropped off the bottom of the frame while the slice
+     bursts apart, so the composition is never fully visible. We use only
+     the first 4.4s and mirror it, so scrolling lifts the slice and then
+     sets it back down on the cake. The source has no shot of the slice
+     landing — the mirror creates one.
+   - **Background.** The subject sits on a bright studio sweep. Each frame
+     gets a difference matte: rebuild the sweep behind the subject (coarse
+     grid + Laplace inpainting), then derive alpha from each pixel's
+     departure from that plate. Keeps highlights and the soft contact
+     shadow, which a luma key destroys. Measured separation on this
+     footage: subject at luma 28-140, sweep at 214-244.
 2. A pinned full-viewport hero section renders a `<canvas>`. GSAP
    `ScrollTrigger` (scrub mode) maps scroll progress within the pinned
    section (0–1) to a frame index (0–149) and draws that frame to canvas
    on each scroll tick — no video element, no 3D engine.
-3. Text callouts are absolutely positioned over the canvas and fade
-   in/out at scroll-progress checkpoints (GSAP timeline tied to the same
-   ScrollTrigger).
-4. Frames are preloaded: first ~20 eagerly before the pin can start
+3. Sizing: the frame is drawn contain-fit and scaled down so the whole
+   cake is always visible (never cropped). Portrait screens size by width
+   instead, or the subject — which only fills the middle of a 16:9 frame —
+   would shrink to a speck. The frame's bottom sliver is dissolved so the
+   cake running off the source frame never shows as a hard cut.
+4. Display type sits *behind* the canvas; the cake overlapping it is what
+   reads as depth. Headings are short so they stay legible around the
+   cake, which is wide. Text callouts fade in/out at scroll-progress
+   checkpoints, driven from the same ScrollTrigger's `onUpdate`.
+5. Cursor parallax: the cake tilts and drifts toward the pointer (GSAP
+   `quickTo` on rotationX/Y and x/y), so it feels dimensional before the
+   user scrolls at all. Fine pointers only, and off under
+   `prefers-reduced-motion`. Note: the reference site does *not* do this —
+   verified by diffing its DOM under pointer movement — it was added
+   because the client asked for it.
+6. Frames are preloaded: first ~20 eagerly before the pin can start
    (with a lightweight loading state gating scroll), remainder streamed
    in the background.
-5. Mobile: canvas draws at a capped resolution/DPR to protect
+7. Mobile: canvas draws at a capped resolution/DPR to protect
    performance; same frame set is reused (no separate mobile sequence).
 
 ## Page Structure

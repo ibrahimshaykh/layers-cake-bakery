@@ -1,12 +1,31 @@
-// Extracts an evenly-sampled frame sequence from the source cake video and
-// writes optimized WebP frames to public/frames/. Runs at build/dev-prep
-// time only — ffmpeg is never invoked at runtime.
+// Extracts the scroll frame sequence from the source cake video and writes
+// optimized WebP frames with transparent backgrounds to public/frames/.
+// Runs at build/dev-prep time only — ffmpeg is never invoked at runtime.
+//
+// Two things this script has to work around in the source footage:
+//
+// 1. Framing. The camera pushes in for the whole take, and past ~4.4s the
+//    cake's base is cropped off the bottom of the frame while the slice
+//    bursts apart. We therefore use only CLIP_END seconds of the take —
+//    the stretch where the whole cake stays in frame — and then mirror it,
+//    so scrolling lifts the slice and then sets it back down on the cake.
+//    The source has no shot of the slice landing; the mirror creates one.
+//
+// 2. Background. The subject sits on a bright studio sweep. For each frame
+//    we rebuild the sweep behind the subject (coarse grid + Laplace
+//    inpainting) and derive alpha from how far each pixel departs from that
+//    plate. Both the cake's highlights and its soft contact shadow differ
+//    from the plate, so both survive — unlike a luma key, which eats
+//    specular highlights and hard-cuts the shadow.
 import ffmpegPath from "ffmpeg-static";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import {
+  existsSync, mkdirSync, rmSync, openSync, readSync, writeSync, closeSync, statSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 
 const execFileAsync = promisify(execFile);
 
@@ -15,10 +34,201 @@ const projectRoot = path.resolve(__dirname, "..");
 
 const SOURCE = path.join(projectRoot, "source-media", "cake-sequence-source.mp4");
 const OUT_DIR = path.join(projectRoot, "public", "frames");
-const FRAME_COUNT = 150;
-const DURATION_SECONDS = 10;
-const TARGET_WIDTH = 1280;
-const WEBP_QUALITY = 75;
+
+// Only this much of the take keeps the whole cake inside the frame.
+const CLIP_END = 4.4;
+const FORWARD_FRAMES = 76;
+const WIDTH = 1280;
+const HEIGHT = 720;
+const WEBP_QUALITY = 78;
+
+// Matte tuning. Differences below DEAD_ZONE are backdrop noise; differences
+// at or above FULL_OPAQUE are solid subject. The subject is darker than the
+// sweep, so pixels brighter than the plate need a much larger departure
+// before they count — that keeps studio bounce light off the page.
+const DEAD_ZONE = 15;
+const FULL_OPAQUE = 44;
+// Every part of the subject is darker than the sweep, so anything brighter
+// than the plate is bounce light pooling on the backdrop. The thresholds
+// below are set past what the footage ever reaches, which drops that pool
+// entirely while leaving a margin in case a true specular glint appears.
+const BRIGHT_DEAD_ZONE = 92;
+const BRIGHT_FULL_OPAQUE = 140;
+
+// Backdrop plate reconstruction.
+const CELL = 16; // px per coarse grid cell
+// Measured on this footage: the subject sits at luma 28-140, the sweep at
+// 214-244. A drop of 40 puts the cutoff (~200) in that gap with margin on
+// both sides.
+const SUBJECT_LUMA_DROP = 40; // how far below backdrop level reads as subject
+const MASK_DILATE = 2; // cells, to catch soft shadow and edges
+const INPAINT_ITERATIONS = 600;
+// The sweep is darker in the corners than at its centre, dark enough to be
+// mistaken for subject — which would inpaint over real backdrop and leave a
+// ghost of the frame's corner on the page. The cake never comes near the
+// top or side edges, so those are always backdrop. The bottom edge is NOT
+// guarded: by the turnaround frame the cake's base runs off the bottom of
+// the frame, and guarding it would punch a transparent band through it.
+const BORDER_GUARD = 3; // cells, top and sides only
+
+const GRID_W = Math.ceil(WIDTH / CELL);
+const GRID_H = Math.ceil(HEIGHT / CELL);
+
+function luma(r, g, b) {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+// Average each CELL x CELL block into a coarse RGB grid.
+function buildGrid(rgb, grid) {
+  for (let gy = 0; gy < GRID_H; gy++) {
+    const y0 = gy * CELL;
+    const y1 = Math.min(y0 + CELL, HEIGHT);
+    for (let gx = 0; gx < GRID_W; gx++) {
+      const x0 = gx * CELL;
+      const x1 = Math.min(x0 + CELL, WIDTH);
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let y = y0; y < y1; y++) {
+        let i = (y * WIDTH + x0) * 3;
+        for (let x = x0; x < x1; x++) {
+          r += rgb[i]; g += rgb[i + 1]; b += rgb[i + 2];
+          i += 3; n++;
+        }
+      }
+      const gi = (gy * GRID_W + gx) * 3;
+      grid[gi] = r / n;
+      grid[gi + 1] = g / n;
+      grid[gi + 2] = b / n;
+    }
+  }
+}
+
+// Mark cells that read as subject (well below the frame's backdrop level).
+function buildSubjectMask(grid, mask) {
+  const lumas = new Float64Array(GRID_W * GRID_H);
+  for (let i = 0; i < lumas.length; i++) {
+    const gi = i * 3;
+    lumas[i] = luma(grid[gi], grid[gi + 1], grid[gi + 2]);
+  }
+  const sorted = Float64Array.from(lumas).sort();
+  const backdropLevel = sorted[Math.floor(sorted.length * 0.85)];
+  const cutoff = backdropLevel - SUBJECT_LUMA_DROP;
+
+  for (let i = 0; i < lumas.length; i++) mask[i] = lumas[i] < cutoff ? 1 : 0;
+
+  // Dilate so soft shadow and anti-aliased edges are treated as unknown.
+  // (The border guard is re-applied afterwards so dilation can't creep in.)
+  for (let pass = 0; pass < MASK_DILATE; pass++) {
+    const prev = Uint8Array.from(mask);
+    for (let gy = 0; gy < GRID_H; gy++) {
+      for (let gx = 0; gx < GRID_W; gx++) {
+        if (prev[gy * GRID_W + gx]) continue;
+        const up = gy > 0 && prev[(gy - 1) * GRID_W + gx];
+        const down = gy < GRID_H - 1 && prev[(gy + 1) * GRID_W + gx];
+        const left = gx > 0 && prev[gy * GRID_W + gx - 1];
+        const right = gx < GRID_W - 1 && prev[gy * GRID_W + gx + 1];
+        if (up || down || left || right) mask[gy * GRID_W + gx] = 1;
+      }
+    }
+  }
+
+  for (let gy = 0; gy < GRID_H; gy++) {
+    for (let gx = 0; gx < GRID_W; gx++) {
+      const edge =
+        gx < BORDER_GUARD || gx >= GRID_W - BORDER_GUARD || gy < BORDER_GUARD;
+      if (edge) mask[gy * GRID_W + gx] = 0;
+    }
+  }
+}
+
+// Fill masked cells by averaging their neighbours until the surface is smooth.
+function inpaintGrid(grid, mask) {
+  // Seed unknown cells with the mean of the known ones.
+  let sr = 0, sg = 0, sb = 0, n = 0;
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i]) continue;
+    const gi = i * 3;
+    sr += grid[gi]; sg += grid[gi + 1]; sb += grid[gi + 2]; n++;
+  }
+  if (!n) return;
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    const gi = i * 3;
+    grid[gi] = sr / n; grid[gi + 1] = sg / n; grid[gi + 2] = sb / n;
+  }
+
+  const next = Float64Array.from(grid);
+  for (let it = 0; it < INPAINT_ITERATIONS; it++) {
+    for (let gy = 0; gy < GRID_H; gy++) {
+      for (let gx = 0; gx < GRID_W; gx++) {
+        const idx = gy * GRID_W + gx;
+        if (!mask[idx]) continue;
+        const gi = idx * 3;
+        for (let c = 0; c < 3; c++) {
+          let sum = 0, count = 0;
+          if (gy > 0) { sum += grid[((gy - 1) * GRID_W + gx) * 3 + c]; count++; }
+          if (gy < GRID_H - 1) { sum += grid[((gy + 1) * GRID_W + gx) * 3 + c]; count++; }
+          if (gx > 0) { sum += grid[(gy * GRID_W + gx - 1) * 3 + c]; count++; }
+          if (gx < GRID_W - 1) { sum += grid[(gy * GRID_W + gx + 1) * 3 + c]; count++; }
+          next[gi + c] = sum / count;
+        }
+      }
+    }
+    for (let i = 0; i < mask.length; i++) {
+      if (!mask[i]) continue;
+      const gi = i * 3;
+      grid[gi] = next[gi]; grid[gi + 1] = next[gi + 1]; grid[gi + 2] = next[gi + 2];
+    }
+  }
+}
+
+// Bilinear sample of the coarse plate at a full-res pixel.
+function samplePlate(grid, x, y, out) {
+  const fx = Math.min(GRID_W - 1.001, Math.max(0, (x + 0.5) / CELL - 0.5));
+  const fy = Math.min(GRID_H - 1.001, Math.max(0, (y + 0.5) / CELL - 0.5));
+  const x0 = Math.floor(fx), y0 = Math.floor(fy);
+  const tx = fx - x0, ty = fy - y0;
+  const i00 = (y0 * GRID_W + x0) * 3;
+  const i10 = (y0 * GRID_W + x0 + 1) * 3;
+  const i01 = ((y0 + 1) * GRID_W + x0) * 3;
+  const i11 = ((y0 + 1) * GRID_W + x0 + 1) * 3;
+  for (let c = 0; c < 3; c++) {
+    const top = grid[i00 + c] * (1 - tx) + grid[i10 + c] * tx;
+    const bottom = grid[i01 + c] * (1 - tx) + grid[i11 + c] * tx;
+    out[c] = top * (1 - ty) + bottom * ty;
+  }
+}
+
+function matteFrame(rgb, rgba, grid, mask) {
+  buildGrid(rgb, grid);
+  buildSubjectMask(grid, mask);
+  inpaintGrid(grid, mask);
+
+  const plate = [0, 0, 0];
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      samplePlate(grid, x, y, plate);
+      const si = (y * WIDTH + x) * 3;
+      const r = rgb[si], g = rgb[si + 1], b = rgb[si + 2];
+
+      const diff = Math.max(
+        Math.abs(r - plate[0]),
+        Math.abs(g - plate[1]),
+        Math.abs(b - plate[2])
+      );
+      const brighter = r + g + b > plate[0] + plate[1] + plate[2];
+      const dead = brighter ? BRIGHT_DEAD_ZONE : DEAD_ZONE;
+      const solid = brighter ? BRIGHT_FULL_OPAQUE : FULL_OPAQUE;
+
+      let a;
+      if (diff <= dead) a = 0;
+      else if (diff >= solid) a = 255;
+      else a = Math.round(((diff - dead) / (solid - dead)) * 255);
+
+      const di = (y * WIDTH + x) * 4;
+      rgba[di] = r; rgba[di + 1] = g; rgba[di + 2] = b; rgba[di + 3] = a;
+    }
+  }
+}
 
 async function main() {
   if (!existsSync(SOURCE)) {
@@ -26,26 +236,89 @@ async function main() {
     process.exit(1);
   }
 
-  rmSync(OUT_DIR, { recursive: true, force: true });
-  mkdirSync(OUT_DIR, { recursive: true });
+  const tmpDir = path.join(os.tmpdir(), `layers-frames-${process.pid}`);
+  mkdirSync(tmpDir, { recursive: true });
+  const rgbPath = path.join(tmpDir, "frames.rgb");
+  const rgbaPath = path.join(tmpDir, "frames.rgba");
 
-  const fps = FRAME_COUNT / DURATION_SECONDS; // 15fps -> 150 frames over 10s
-  const outputPattern = path.join(OUT_DIR, "frame-%03d.webp");
+  try {
+    const fps = FORWARD_FRAMES / CLIP_END;
 
-  const args = [
-    "-y",
-    "-i", SOURCE,
-    "-vf", `fps=${fps},scale=${TARGET_WIDTH}:-1:flags=lanczos`,
-    "-vframes", String(FRAME_COUNT),
-    "-c:v", "libwebp",
-    "-quality", String(WEBP_QUALITY),
-    "-preset", "photo",
-    outputPattern,
-  ];
+    console.log(`Decoding ${FORWARD_FRAMES} frames from the first ${CLIP_END}s...`);
+    await execFileAsync(ffmpegPath, [
+      "-y", "-v", "error",
+      "-t", String(CLIP_END),
+      "-i", SOURCE,
+      "-vf", `fps=${fps},scale=${WIDTH}:${HEIGHT}:flags=lanczos`,
+      "-vframes", String(FORWARD_FRAMES),
+      "-f", "rawvideo", "-pix_fmt", "rgb24",
+      rgbPath,
+    ]);
 
-  console.log(`Extracting ${FRAME_COUNT} frames at ${fps}fps, ${TARGET_WIDTH}px wide...`);
-  await execFileAsync(ffmpegPath, args);
-  console.log(`Done. Frames written to ${OUT_DIR}`);
+    const frameBytesRgb = WIDTH * HEIGHT * 3;
+    const frameBytesRgba = WIDTH * HEIGHT * 4;
+    const available = Math.min(
+      FORWARD_FRAMES,
+      Math.floor(statSync(rgbPath).size / frameBytesRgb)
+    );
+    if (available < FORWARD_FRAMES) {
+      console.warn(`Only ${available} frames decoded (wanted ${FORWARD_FRAMES}).`);
+    }
+
+    console.log("Matting the studio sweep out of each frame...");
+    const rgb = Buffer.alloc(frameBytesRgb);
+    const grid = new Float64Array(GRID_W * GRID_H * 3);
+    const mask = new Uint8Array(GRID_W * GRID_H);
+    // Matted frames are cached so the mirrored half is written without
+    // paying for the matte twice.
+    const matted = [];
+    const inFd = openSync(rgbPath, "r");
+    try {
+      for (let i = 0; i < available; i++) {
+        readSync(inFd, rgb, 0, frameBytesRgb, i * frameBytesRgb);
+        const rgba = Buffer.alloc(frameBytesRgba);
+        matteFrame(rgb, rgba, grid, mask);
+        matted.push(rgba);
+        if ((i + 1) % 10 === 0) console.log(`  ${i + 1}/${available}`);
+      }
+    } finally {
+      closeSync(inFd);
+    }
+
+    // Forward, then back down again (skipping the turnaround and opening
+    // frames so neither end stutters).
+    const order = [
+      ...matted.keys(),
+      ...[...matted.keys()].reverse().slice(1, -1),
+    ];
+
+    const outFd = openSync(rgbaPath, "w");
+    try {
+      for (const i of order) writeSync(outFd, matted[i], 0, frameBytesRgba);
+    } finally {
+      closeSync(outFd);
+    }
+
+    rmSync(OUT_DIR, { recursive: true, force: true });
+    mkdirSync(OUT_DIR, { recursive: true });
+
+    console.log(`Encoding ${order.length} transparent WebP frames...`);
+    await execFileAsync(ffmpegPath, [
+      "-y", "-v", "error",
+      "-f", "rawvideo", "-pix_fmt", "rgba",
+      "-s", `${WIDTH}x${HEIGHT}`,
+      "-i", rgbaPath,
+      "-c:v", "libwebp",
+      "-quality", String(WEBP_QUALITY),
+      "-preset", "photo",
+      path.join(OUT_DIR, "frame-%03d.webp"),
+    ]);
+
+    console.log(`Done. ${order.length} frames written to ${OUT_DIR}`);
+    console.log(`Set FRAME_COUNT in ScrollCakeHero.tsx to ${order.length}.`);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
 main().catch((err) => {
