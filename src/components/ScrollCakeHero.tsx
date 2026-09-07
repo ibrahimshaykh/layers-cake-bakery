@@ -23,8 +23,13 @@ const FIT_SCALE = 0.88;
 // On portrait screens a contain-fit would shrink the cake to a speck, since
 // the subject only fills the middle of a 16:9 frame. There we size by width
 // instead and let the frame's empty (transparent) sides run off screen.
-const PORTRAIT_WIDTH_FACTOR = 1.7;
-const PORTRAIT_MAX_HEIGHT = 0.6;
+// These were originally tuned low (1.7 / 0.6) and left the cake noticeably
+// smaller than on desktop — late in the sequence the base decoration was
+// squeezed into a sliver a few dozen px tall at the very bottom edge.
+// Raised to match desktop's presence: MAX_HEIGHT close to FIT_SCALE above,
+// and WIDTH_FACTOR high enough that height, not width, is what binds.
+const PORTRAIT_WIDTH_FACTOR = 3;
+const PORTRAIT_MAX_HEIGHT = 0.85;
 // Flying chocolate gets cropped at the top and sides late in the take.
 // Without a backdrop to sit in, those crops would read as hard straight
 // cuts, so those edges dissolve. The bottom needs no fade: the frame is
