@@ -6,7 +6,14 @@ import ScrollTrigger from "gsap/ScrollTrigger";
 import { hero } from "@/content/site";
 
 const FRAME_COUNT = 150;
-const EAGER_FRAME_COUNT = 20;
+// Only the frames actually needed to paint the resting hero are gated on.
+// Each frame is ~30KB and cold TTFB runs ~0.6s, so waiting on a big batch
+// left "Loading the cake…" on screen for several seconds; the rest stream
+// in behind the visible hero instead.
+const EAGER_FRAME_COUNT = 2;
+// How many of the remaining frames to fetch at once. Enough to stay ahead
+// of a scroll, few enough not to saturate the connection.
+const PRELOAD_CONCURRENCY = 8;
 const PIN_HEIGHT_VH = 320; // scroll distance the sequence plays across
 
 // The cake is drawn "contain"-fit (whole subject always visible) and then
@@ -66,9 +73,16 @@ export default function ScrollCakeHero() {
       imagesRef.current = images;
       setImagesReady(true);
 
-      for (let i = EAGER_FRAME_COUNT; i < FRAME_COUNT; i++) {
+      // Stream the rest in order, a few at a time. Frames that haven't
+      // arrived yet are simply skipped by drawFrame, which holds the last
+      // painted frame rather than blanking the canvas.
+      for (let i = EAGER_FRAME_COUNT; i < FRAME_COUNT; i += PRELOAD_CONCURRENCY) {
         if (cancelled) return;
-        await loadFrame(i);
+        const batch = [];
+        for (let j = i; j < Math.min(i + PRELOAD_CONCURRENCY, FRAME_COUNT); j++) {
+          batch.push(loadFrame(j));
+        }
+        await Promise.all(batch);
       }
     }
 
