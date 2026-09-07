@@ -12,15 +12,25 @@ const PIN_HEIGHT_VH = 320; // scroll distance the sequence plays across
 // The cake is drawn "contain"-fit (whole subject always visible) and then
 // scaled down so it floats with breathing room, like a product shot.
 // The frames carry their own alpha, so nothing but the cake is painted.
-const FIT_SCALE = 0.72;
+const FIT_SCALE = 0.88;
 // On portrait screens a contain-fit would shrink the cake to a speck, since
 // the subject only fills the middle of a 16:9 frame. There we size by width
 // instead and let the frame's empty (transparent) sides run off screen.
 const PORTRAIT_WIDTH_FACTOR = 1.7;
 const PORTRAIT_MAX_HEIGHT = 0.6;
-// Fraction of the frame height dissolved at the bottom edge, so the cake
-// running off the source frame never shows as a hard horizontal cut.
-const BOTTOM_FADE = 0.09;
+// Flying chocolate gets cropped at the top and sides late in the take.
+// Without a backdrop to sit in, those crops would read as hard straight
+// cuts, so those edges dissolve. The bottom needs no fade: the frame is
+// anchored past the bottom of the viewport (see BOTTOM_OVERSHOOT), so the
+// cake's cropped base runs off screen rather than ending in mid-air.
+const EDGE_FADE = { top: 0.06, bottom: 0, left: 0.05, right: 0.05 };
+// How far below the viewport's bottom edge the frame is anchored, as a
+// fraction of the drawn frame height.
+const BOTTOM_OVERSHOOT = 0.04;
+// The camera pushes in across the take, which would make the cake balloon
+// and crowd the viewport by the end. Drawing later frames progressively
+// smaller cancels most of that, keeping the subject a steady size.
+const COUNTER_ZOOM_END = 0.78;
 
 function frameUrl(index: number) {
   const n = String(index + 1).padStart(3, "0");
@@ -100,24 +110,41 @@ export default function ScrollCakeHero() {
       scale =
         Math.min(cssWidth / img.naturalWidth, cssHeight / img.naturalHeight) * FIT_SCALE;
     }
+
+    // Cancel the source's push-in so the cake holds a steady size.
+    const through = FRAME_COUNT > 1 ? index / (FRAME_COUNT - 1) : 0;
+    scale *= 1 + (COUNTER_ZOOM_END - 1) * through;
+
     const drawWidth = img.naturalWidth * scale;
     const drawHeight = img.naturalHeight * scale;
+    // Anchored to the bottom, not centred: the cake stays grounded on the
+    // page, and where the camera crops its base the crop falls off screen.
     const dx = (cssWidth - drawWidth) / 2;
-    const dy = (cssHeight - drawHeight) / 2;
+    const dy = cssHeight - drawHeight + drawHeight * BOTTOM_OVERSHOOT;
     ctx.drawImage(img, dx, dy, drawWidth, drawHeight);
 
-    // Late in the sequence the cake's base runs off the bottom of the source
-    // frame, which would otherwise show as a flat cut floating mid-page.
-    // Dissolve that last sliver; at rest the cake ends above it untouched.
-    const fadeHeight = drawHeight * BOTTOM_FADE;
-    const fadeTop = dy + drawHeight - fadeHeight;
+    // Dissolve anything the camera cropped at the frame's edges.
+    const right = dx + drawWidth;
+    const bottom = dy + drawHeight;
+    const bands: Array<[number, number, number, number, number[], number[]]> = [
+      // [x, y, w, h, gradient start point, gradient end point]
+      [dx, dy, drawWidth, drawHeight * EDGE_FADE.top, [0, dy + drawHeight * EDGE_FADE.top], [0, dy]],
+      [dx, bottom - drawHeight * EDGE_FADE.bottom, drawWidth, drawHeight * EDGE_FADE.bottom,
+        [0, bottom - drawHeight * EDGE_FADE.bottom], [0, bottom]],
+      [dx, dy, drawWidth * EDGE_FADE.left, drawHeight, [dx + drawWidth * EDGE_FADE.left, 0], [dx, 0]],
+      [right - drawWidth * EDGE_FADE.right, dy, drawWidth * EDGE_FADE.right, drawHeight,
+        [right - drawWidth * EDGE_FADE.right, 0], [right, 0]],
+    ];
+
     ctx.save();
     ctx.globalCompositeOperation = "destination-out";
-    const fade = ctx.createLinearGradient(0, fadeTop, 0, dy + drawHeight);
-    fade.addColorStop(0, "rgba(0,0,0,0)");
-    fade.addColorStop(1, "rgba(0,0,0,1)");
-    ctx.fillStyle = fade;
-    ctx.fillRect(dx, fadeTop, drawWidth, fadeHeight);
+    for (const [bx, by, bw, bh, from, to] of bands) {
+      const fade = ctx.createLinearGradient(from[0], from[1], to[0], to[1]);
+      fade.addColorStop(0, "rgba(0,0,0,0)");
+      fade.addColorStop(1, "rgba(0,0,0,1)");
+      ctx.fillStyle = fade;
+      ctx.fillRect(bx, by, bw, bh);
+    }
     ctx.restore();
   };
 
@@ -279,27 +306,29 @@ export default function ScrollCakeHero() {
         {hero.eyebrow}
       </p>
 
-      {/* Supporting line for the active checkpoint, out of the cake's way. */}
-      <div className="absolute bottom-24 left-6 z-20 h-16 w-full max-w-xs sm:left-10 sm:bottom-20">
-        {hero.checkpoints.map((cp, i) =>
-          cp.body ? (
-            <p
-              key={i}
-              data-checkpoint={i}
-              className="absolute inset-0 text-sm leading-relaxed text-cocoa-light"
-            >
-              {cp.body}
-            </p>
-          ) : null
-        )}
+      {/* Supporting line and CTA hug the bottom-left corner, clear of the
+          centre column where the cake sits and the slice travels. */}
+      <div className="absolute inset-x-6 top-[19%] z-20 mt-36 flex flex-col items-center gap-4 text-center sm:inset-x-auto sm:top-auto sm:bottom-10 sm:left-10 sm:mt-0 sm:w-[22rem] sm:items-start sm:text-left">
+        <div className="relative h-16 w-full">
+          {hero.checkpoints.map((cp, i) =>
+            cp.body ? (
+              <p
+                key={i}
+                data-checkpoint={i}
+                className="absolute inset-0 text-sm leading-relaxed text-cocoa-light"
+              >
+                {cp.body}
+              </p>
+            ) : null
+          )}
+        </div>
+        <a
+          href={hero.ctaHref}
+          className="rounded-full bg-cocoa px-6 py-3 text-sm font-medium text-cream transition hover:bg-cocoa-light"
+        >
+          {hero.ctaLabel}
+        </a>
       </div>
-
-      <a
-        href={hero.ctaHref}
-        className="absolute bottom-8 left-1/2 z-20 -translate-x-1/2 rounded-full bg-cocoa px-6 py-3 text-sm font-medium text-cream transition hover:bg-cocoa-light"
-      >
-        {hero.ctaLabel}
-      </a>
 
       <span className="absolute bottom-10 right-6 z-20 hidden text-xs uppercase tracking-[0.3em] text-cocoa-light/70 sm:right-10 sm:block">
         Scroll

@@ -2,21 +2,19 @@
 // optimized WebP frames with transparent backgrounds to public/frames/.
 // Runs at build/dev-prep time only — ffmpeg is never invoked at runtime.
 //
-// Two things this script has to work around in the source footage:
+// The full take is used, so the scroll plays the whole video through. Note
+// that the camera pushes in throughout: past ~4.5s the cake's base leaves
+// the bottom of the frame, and the take ends on the slice bursting apart
+// rather than landing. That framing is baked into the footage — the hero
+// counter-zooms to keep the subject a steady size and dissolves the frame's
+// bottom edge, but content the camera cropped cannot be recovered here.
 //
-// 1. Framing. The camera pushes in for the whole take, and past ~4.4s the
-//    cake's base is cropped off the bottom of the frame while the slice
-//    bursts apart. We therefore use only CLIP_END seconds of the take —
-//    the stretch where the whole cake stays in frame — and then mirror it,
-//    so scrolling lifts the slice and then sets it back down on the cake.
-//    The source has no shot of the slice landing; the mirror creates one.
-//
-// 2. Background. The subject sits on a bright studio sweep. For each frame
-//    we rebuild the sweep behind the subject (coarse grid + Laplace
-//    inpainting) and derive alpha from how far each pixel departs from that
-//    plate. Both the cake's highlights and its soft contact shadow differ
-//    from the plate, so both survive — unlike a luma key, which eats
-//    specular highlights and hard-cuts the shadow.
+// Background: the subject sits on a bright studio sweep. For each frame we
+// rebuild the sweep behind the subject (coarse grid + Laplace inpainting)
+// and derive alpha from how far each pixel departs from that plate. Both
+// the cake's highlights and its soft contact shadow differ from the plate,
+// so both survive — unlike a luma key, which eats specular highlights and
+// hard-cuts the shadow.
 import ffmpegPath from "ffmpeg-static";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -35,9 +33,9 @@ const projectRoot = path.resolve(__dirname, "..");
 const SOURCE = path.join(projectRoot, "source-media", "cake-sequence-source.mp4");
 const OUT_DIR = path.join(projectRoot, "public", "frames");
 
-// Only this much of the take keeps the whole cake inside the frame.
-const CLIP_END = 4.4;
-const FORWARD_FRAMES = 76;
+// The whole take, start to finish.
+const CLIP_END = 10;
+const FORWARD_FRAMES = 150;
 const WIDTH = 1280;
 const HEIGHT = 720;
 const WEBP_QUALITY = 78;
@@ -63,13 +61,10 @@ const CELL = 16; // px per coarse grid cell
 const SUBJECT_LUMA_DROP = 40; // how far below backdrop level reads as subject
 const MASK_DILATE = 2; // cells, to catch soft shadow and edges
 const INPAINT_ITERATIONS = 600;
-// The sweep is darker in the corners than at its centre, dark enough to be
-// mistaken for subject — which would inpaint over real backdrop and leave a
-// ghost of the frame's corner on the page. The cake never comes near the
-// top or side edges, so those are always backdrop. The bottom edge is NOT
-// guarded: by the turnaround frame the cake's base runs off the bottom of
-// the frame, and guarding it would punch a transparent band through it.
-const BORDER_GUARD = 3; // cells, top and sides only
+// No border guard: over the full take the cake's base runs off the bottom
+// of the frame and flying chocolate reaches the top and sides, so forcing
+// edge cells to "backdrop" would punch holes through real subject. The
+// luma cutoff above already clears the sweep's dark corners by ~14 levels.
 
 const GRID_W = Math.ceil(WIDTH / CELL);
 const GRID_H = Math.ceil(HEIGHT / CELL);
@@ -116,7 +111,6 @@ function buildSubjectMask(grid, mask) {
   for (let i = 0; i < lumas.length; i++) mask[i] = lumas[i] < cutoff ? 1 : 0;
 
   // Dilate so soft shadow and anti-aliased edges are treated as unknown.
-  // (The border guard is re-applied afterwards so dilation can't creep in.)
   for (let pass = 0; pass < MASK_DILATE; pass++) {
     const prev = Uint8Array.from(mask);
     for (let gy = 0; gy < GRID_H; gy++) {
@@ -131,13 +125,6 @@ function buildSubjectMask(grid, mask) {
     }
   }
 
-  for (let gy = 0; gy < GRID_H; gy++) {
-    for (let gx = 0; gx < GRID_W; gx++) {
-      const edge =
-        gx < BORDER_GUARD || gx >= GRID_W - BORDER_GUARD || gy < BORDER_GUARD;
-      if (edge) mask[gy * GRID_W + gx] = 0;
-    }
-  }
 }
 
 // Fill masked cells by averaging their neighbours until the surface is smooth.
@@ -267,42 +254,27 @@ async function main() {
 
     console.log("Matting the studio sweep out of each frame...");
     const rgb = Buffer.alloc(frameBytesRgb);
+    const rgba = Buffer.alloc(frameBytesRgba);
     const grid = new Float64Array(GRID_W * GRID_H * 3);
     const mask = new Uint8Array(GRID_W * GRID_H);
-    // Matted frames are cached so the mirrored half is written without
-    // paying for the matte twice.
-    const matted = [];
     const inFd = openSync(rgbPath, "r");
+    const outFd = openSync(rgbaPath, "w");
     try {
       for (let i = 0; i < available; i++) {
         readSync(inFd, rgb, 0, frameBytesRgb, i * frameBytesRgb);
-        const rgba = Buffer.alloc(frameBytesRgba);
         matteFrame(rgb, rgba, grid, mask);
-        matted.push(rgba);
-        if ((i + 1) % 10 === 0) console.log(`  ${i + 1}/${available}`);
+        writeSync(outFd, rgba, 0, frameBytesRgba);
+        if ((i + 1) % 20 === 0) console.log(`  ${i + 1}/${available}`);
       }
     } finally {
       closeSync(inFd);
-    }
-
-    // Forward, then back down again (skipping the turnaround and opening
-    // frames so neither end stutters).
-    const order = [
-      ...matted.keys(),
-      ...[...matted.keys()].reverse().slice(1, -1),
-    ];
-
-    const outFd = openSync(rgbaPath, "w");
-    try {
-      for (const i of order) writeSync(outFd, matted[i], 0, frameBytesRgba);
-    } finally {
       closeSync(outFd);
     }
 
     rmSync(OUT_DIR, { recursive: true, force: true });
     mkdirSync(OUT_DIR, { recursive: true });
 
-    console.log(`Encoding ${order.length} transparent WebP frames...`);
+    console.log(`Encoding ${available} transparent WebP frames...`);
     await execFileAsync(ffmpegPath, [
       "-y", "-v", "error",
       "-f", "rawvideo", "-pix_fmt", "rgba",
@@ -314,8 +286,8 @@ async function main() {
       path.join(OUT_DIR, "frame-%03d.webp"),
     ]);
 
-    console.log(`Done. ${order.length} frames written to ${OUT_DIR}`);
-    console.log(`Set FRAME_COUNT in ScrollCakeHero.tsx to ${order.length}.`);
+    console.log(`Done. ${available} frames written to ${OUT_DIR}`);
+    console.log(`Set FRAME_COUNT in ScrollCakeHero.tsx to ${available}.`);
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }

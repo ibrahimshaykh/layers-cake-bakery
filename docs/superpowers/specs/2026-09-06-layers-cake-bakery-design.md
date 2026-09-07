@@ -19,12 +19,14 @@ to create a sense of depth, modeled on https://remix-of-cccc.vercel.app/.
 1. At build time, `scripts/extract-frames.mjs` turns the source video into
    150 transparent WebP frames in `public/frames/` (ffmpeg-static, no
    system ffmpeg dependency). Two things it works around:
-   - **Framing.** The camera pushes in for the whole take; past ~4.4s the
-     cake's base is cropped off the bottom of the frame while the slice
-     bursts apart, so the composition is never fully visible. We use only
-     the first 4.4s and mirror it, so scrolling lifts the slice and then
-     sets it back down on the cake. The source has no shot of the slice
-     landing — the mirror creates one.
+   - **Framing.** The full 10s take is used, so the scroll plays the whole
+     video through — this was an explicit client requirement. Note the
+     camera pushes in throughout: past ~4.5s the cake's base leaves the
+     bottom of the frame, and the take ends on the slice bursting apart
+     rather than landing. That content was never filmed and cannot be
+     recovered in code; the hero counter-zooms and bottom-anchors to keep
+     the crop off screen (see 3). Getting a true "slice lands on the whole
+     cake" beat needs re-shot footage with a wider, locked-off framing.
    - **Background.** The subject sits on a bright studio sweep. Each frame
      gets a difference matte: rebuild the sweep behind the subject (coarse
      grid + Laplace inpainting), then derive alpha from each pixel's
@@ -35,14 +37,26 @@ to create a sense of depth, modeled on https://remix-of-cccc.vercel.app/.
    `ScrollTrigger` (scrub mode) maps scroll progress within the pinned
    section (0–1) to a frame index (0–149) and draws that frame to canvas
    on each scroll tick — no video element, no 3D engine.
-3. Sizing: the frame is drawn contain-fit and scaled down so the whole
-   cake is always visible (never cropped). Portrait screens size by width
-   instead, or the subject — which only fills the middle of a 16:9 frame —
-   would shrink to a speck. The frame's bottom sliver is dissolved so the
-   cake running off the source frame never shows as a hard cut.
+3. Sizing and placement:
+   - Contain-fit and scaled down, so the cake is never cropped by us.
+     Portrait screens size by width instead, or the subject — which only
+     fills the middle of a 16:9 frame — would shrink to a speck.
+   - Anchored to the bottom of the viewport (slightly past it), not
+     centred. This is what stops the camera's crop from reading as a
+     half-drawn cake floating in mid-air: it simply runs off screen, the
+     way any full-bleed hero image does.
+   - A counter-zoom draws later frames progressively smaller, cancelling
+     most of the source's push-in so the cake holds a steady size.
+   - Top and side edges feather, so flying chocolate cropped by the camera
+     dissolves instead of ending in a straight cut. The bottom needs no
+     fade because of the anchoring above.
 4. Display type sits *behind* the canvas; the cake overlapping it is what
-   reads as depth. Headings are short so they stay legible around the
-   cake, which is wide. Text callouts fade in/out at scroll-progress
+   reads as depth. Headings are short and ride above the cake, because
+   this cake is wide where the reference's cookie stack is narrow — a long
+   centred line would be unreadable behind it. The rising slice sweeps in
+   front of the type mid-scroll instead. Supporting copy and the CTA sit
+   bottom-left on desktop, and move up under the headline on phones where
+   the cake fills the lower half. Callouts fade in/out at scroll-progress
    checkpoints, driven from the same ScrollTrigger's `onUpdate`.
 5. Cursor parallax: the cake tilts and drifts toward the pointer (GSAP
    `quickTo` on rotationX/Y and x/y), so it feels dimensional before the
