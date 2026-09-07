@@ -24,9 +24,9 @@ to create a sense of depth, modeled on https://remix-of-cccc.vercel.app/.
      camera pushes in throughout: past ~4.5s the cake's base leaves the
      bottom of the frame, and the take ends on the slice bursting apart
      rather than landing. That content was never filmed and cannot be
-     recovered in code; the hero counter-zooms and bottom-anchors to keep
-     the crop off screen (see 3). Getting a true "slice lands on the whole
-     cake" beat needs re-shot footage with a wider, locked-off framing.
+     recovered in code; the hero bottom-anchors to keep the crop off
+     screen (see 3). Getting a true "slice lands on the whole cake" beat
+     needs re-shot footage with a wider, locked-off framing.
    - **Background.** The subject sits on a bright studio sweep. Each frame
      gets a difference matte: rebuild the sweep behind the subject (coarse
      grid + Laplace inpainting), then derive alpha from each pixel's
@@ -45,8 +45,14 @@ to create a sense of depth, modeled on https://remix-of-cccc.vercel.app/.
      centred. This is what stops the camera's crop from reading as a
      half-drawn cake floating in mid-air: it simply runs off screen, the
      way any full-bleed hero image does.
-   - A counter-zoom draws later frames progressively smaller, cancelling
-     most of the source's push-in so the cake holds a steady size.
+   - No counter-zoom: frames are decoded at a fixed 1280x720 and the
+     camera's push-in is baked into the pixels, so drawing them at one
+     constant scale is exactly what makes the subject fill more of the
+     screen as the scroll goes on — the same growth the source video
+     itself plays. An earlier version scaled later frames down to hold a
+     "steady size", but that shrank the base out of view well before the
+     camera actually cropped it, undercutting the moment the push-in is
+     meant to deliver — reported and fixed 2026-09-07.
    - Top and side edges feather, so flying chocolate cropped by the camera
      dissolves instead of ending in a straight cut. The bottom needs no
      fade because of the anchoring above.

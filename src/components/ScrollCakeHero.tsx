@@ -34,10 +34,12 @@ const EDGE_FADE = { top: 0.06, bottom: 0, left: 0.05, right: 0.05 };
 // How far below the viewport's bottom edge the frame is anchored, as a
 // fraction of the drawn frame height.
 const BOTTOM_OVERSHOOT = 0.04;
-// The camera pushes in across the take, which would make the cake balloon
-// and crowd the viewport by the end. Drawing later frames progressively
-// smaller cancels most of that, keeping the subject a steady size.
-const COUNTER_ZOOM_END = 0.78;
+// No counter-zoom: the source's own push-in is what makes the cake fill
+// more of the screen as you scroll, base and all, the same way it plays in
+// the original video. An earlier version shrank later frames to keep the
+// subject a "steady size", but that also shrank the base out of view well
+// before the camera actually cropped it — undoing the exact moment the
+// push-in is meant to deliver.
 
 function frameUrl(index: number) {
   const n = String(index + 1).padStart(3, "0");
@@ -124,10 +126,6 @@ export default function ScrollCakeHero() {
       scale =
         Math.min(cssWidth / img.naturalWidth, cssHeight / img.naturalHeight) * FIT_SCALE;
     }
-
-    // Cancel the source's push-in so the cake holds a steady size.
-    const through = FRAME_COUNT > 1 ? index / (FRAME_COUNT - 1) : 0;
-    scale *= 1 + (COUNTER_ZOOM_END - 1) * through;
 
     const drawWidth = img.naturalWidth * scale;
     const drawHeight = img.naturalHeight * scale;
@@ -322,7 +320,7 @@ export default function ScrollCakeHero() {
 
       {/* Supporting line and CTA hug the bottom-left corner, clear of the
           centre column where the cake sits and the slice travels. */}
-      <div className="absolute inset-x-6 top-[19%] z-20 mt-36 flex flex-col items-center gap-4 text-center sm:inset-x-auto sm:top-auto sm:bottom-10 sm:left-10 sm:mt-0 sm:w-[22rem] sm:items-start sm:text-left">
+      <div className="absolute inset-x-6 top-[19%] z-20 mt-36 flex flex-col items-center gap-4 text-center sm:inset-x-auto sm:top-auto sm:bottom-10 sm:left-10 sm:mt-0 sm:w-88 sm:items-start sm:text-left">
         <div className="relative h-16 w-full">
           {hero.checkpoints.map((cp, i) =>
             cp.body ? (
