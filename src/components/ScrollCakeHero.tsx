@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import gsap from "gsap";
 import ScrollTrigger from "gsap/ScrollTrigger";
 import { hero } from "@/content/site";
@@ -28,8 +28,8 @@ const FIT_SCALE = 0.88;
 // squeezed into a sliver a few dozen px tall at the very bottom edge.
 // Raised to match desktop's presence: MAX_HEIGHT close to FIT_SCALE above,
 // and WIDTH_FACTOR high enough that height, not width, is what binds.
-const PORTRAIT_WIDTH_FACTOR = 3;
-const PORTRAIT_MAX_HEIGHT = 0.85;
+const PORTRAIT_WIDTH_FACTOR = 2;
+const PORTRAIT_MAX_HEIGHT = 0.62;
 // Flying chocolate gets cropped at the top and sides late in the take.
 // Without a backdrop to sit in, those crops would read as hard straight
 // cuts, so those edges dissolve. The bottom needs no fade: the frame is
@@ -51,12 +51,101 @@ function frameUrl(index: number) {
   return `/frames/frame-${n}.webp`;
 }
 
+// Every extracted frame is decoded at this fixed size (see
+// scripts/extract-frames.mjs), so layout math never needs to touch an
+// actual <img> — it's the same for frame 1 and frame 150.
+const NATIVE_WIDTH = 1280;
+const NATIVE_HEIGHT = 720;
+
+type Layout = {
+  dx: number;
+  dy: number;
+  drawWidth: number;
+  drawHeight: number;
+  // Precomputed destination-out gradient fills for the edge dissolve.
+  // Position/size never change between frames at a given canvas size, so
+  // these are built once per resize instead of once per scroll tick.
+  bands: Array<{ x: number; y: number; w: number; h: number; gradient: CanvasGradient }>;
+};
+
+function computeLayout(ctx: CanvasRenderingContext2D, cssWidth: number, cssHeight: number): Layout {
+  let scale;
+  if (cssHeight > cssWidth) {
+    scale = (cssWidth * PORTRAIT_WIDTH_FACTOR) / NATIVE_WIDTH;
+    const maxHeight = cssHeight * PORTRAIT_MAX_HEIGHT;
+    if (NATIVE_HEIGHT * scale > maxHeight) {
+      scale = maxHeight / NATIVE_HEIGHT;
+    }
+  } else {
+    scale = Math.min(cssWidth / NATIVE_WIDTH, cssHeight / NATIVE_HEIGHT) * FIT_SCALE;
+  }
+
+  const drawWidth = NATIVE_WIDTH * scale;
+  const drawHeight = NATIVE_HEIGHT * scale;
+  const dx = (cssWidth - drawWidth) / 2;
+  const dy = cssHeight - drawHeight + drawHeight * BOTTOM_OVERSHOOT;
+  const right = dx + drawWidth;
+  const bottom = dy + drawHeight;
+
+  const makeBand = (
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    from: [number, number],
+    to: [number, number]
+  ) => {
+    const gradient = ctx.createLinearGradient(from[0], from[1], to[0], to[1]);
+    gradient.addColorStop(0, "rgba(0,0,0,0)");
+    gradient.addColorStop(1, "rgba(0,0,0,1)");
+    return { x, y, w, h, gradient };
+  };
+
+  const bands = [
+    makeBand(dx, dy, drawWidth, drawHeight * EDGE_FADE.top, [0, dy + drawHeight * EDGE_FADE.top], [0, dy]),
+    makeBand(
+      dx,
+      bottom - drawHeight * EDGE_FADE.bottom,
+      drawWidth,
+      drawHeight * EDGE_FADE.bottom,
+      [0, bottom - drawHeight * EDGE_FADE.bottom],
+      [0, bottom]
+    ),
+    makeBand(dx, dy, drawWidth * EDGE_FADE.left, drawHeight, [dx + drawWidth * EDGE_FADE.left, 0], [dx, 0]),
+    makeBand(
+      right - drawWidth * EDGE_FADE.right,
+      dy,
+      drawWidth * EDGE_FADE.right,
+      drawHeight,
+      [right - drawWidth * EDGE_FADE.right, 0],
+      [right, 0]
+    ),
+  ];
+
+  return { dx, dy, drawWidth, drawHeight, bands };
+}
+
 export default function ScrollCakeHero() {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const tiltRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imagesRef = useRef<HTMLImageElement[]>([]);
-  const currentFrameRef = useRef(0);
+  // Two refs, not one: targetFrameRef is "what scroll currently wants
+  // shown", updated on every onUpdate regardless of whether that frame's
+  // image has arrived yet. drawnFrameRef is "what's actually on the
+  // canvas", only updated when a draw succeeds. Collapsing these into one
+  // ref previously meant that if a frame's image arrived late — a real
+  // possibility since frames stream in behind the visible hero — the
+  // target got marked "handled" the moment it was requested, so the
+  // now-skip-if-unchanged draw call below never got a second chance to
+  // paint it once the image showed up. The frame would just never appear.
+  const targetFrameRef = useRef(0);
+  const drawnFrameRef = useRef(-1);
+  const layoutRef = useRef<{ layout: Layout; cssWidth: number; cssHeight: number; dpr: number } | null>(null);
+  // "Latest ref" for drawFrame: the preload effect below is defined before
+  // drawFrame exists and only needs to call it when an image arrives late,
+  // so it reads through this instead of drawFrame being an effect dep.
+  const drawFrameRef = useRef<(index: number) => boolean>(() => false);
   const [imagesReady, setImagesReady] = useState(false);
 
   // Preload frames: first N eagerly (gate on these), rest in background.
@@ -68,7 +157,24 @@ export default function ScrollCakeHero() {
       new Promise<void>((resolve) => {
         const img = new Image();
         img.src = frameUrl(i);
-        img.onload = () => resolve();
+        const done = () => {
+          // Decode off the main thread so the first draw of this frame
+          // doesn't stall on it — otherwise a scroll that reaches a
+          // freshly-arrived frame can visibly hitch on decode.
+          const finish = () => {
+            // If the scroll is already sitting on this frame and it
+            // couldn't paint earlier because this exact image wasn't
+            // ready, paint it now instead of leaving the hero stuck on
+            // whatever last successfully drew.
+            if (i === targetFrameRef.current && drawnFrameRef.current !== i) {
+              if (drawFrameRef.current(i)) drawnFrameRef.current = i;
+            }
+            resolve();
+          };
+          if (img.decode) img.decode().catch(() => {}).finally(finish);
+          else finish();
+        };
+        img.onload = done;
         img.onerror = () => resolve();
         images[i] = img;
       });
@@ -99,14 +205,35 @@ export default function ScrollCakeHero() {
     };
   }, []);
 
-  // Draw the current frame: contained, centered, scaled down, edges feathered.
-  const drawFrame = (index: number) => {
+  // Layout (position/scale/edge-gradients) is identical for every frame at
+  // a given canvas size — nothing here depends on which frame is showing —
+  // so it's computed once per size change instead of once per scroll tick.
+  const getLayout = useCallback(
+    (ctx: CanvasRenderingContext2D, cssWidth: number, cssHeight: number, dpr: number) => {
+      const cached = layoutRef.current;
+      if (cached && cached.cssWidth === cssWidth && cached.cssHeight === cssHeight && cached.dpr === dpr) {
+        return cached.layout;
+      }
+      const layout = computeLayout(ctx, cssWidth, cssHeight);
+      layoutRef.current = { layout, cssWidth, cssHeight, dpr };
+      return layout;
+    },
+    []
+  );
+
+  // Draw the current frame: contained, anchored to the bottom, edges
+  // feathered. Only touches the canvas — no gradient allocation, no scale
+  // math — so it's cheap enough to call on every scroll tick. Returns
+  // whether it actually painted, so callers can tell "drew it" apart from
+  // "this frame's image isn't ready yet" and retry later instead of
+  // treating a skipped draw as done.
+  const drawFrame = useCallback((index: number): boolean => {
     const canvas = canvasRef.current;
     const img = imagesRef.current[index];
-    if (!canvas || !img || !img.complete || img.naturalWidth === 0) return;
+    if (!canvas || !img || !img.complete || img.naturalWidth === 0) return false;
 
     const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    if (!ctx) return false;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const cssWidth = canvas.clientWidth;
@@ -118,59 +245,33 @@ export default function ScrollCakeHero() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-    // Landscape: contain the whole frame, then scale down so the cake floats
-    // with breathing room. Portrait: size by width so the cake stays large.
-    let scale;
-    if (cssHeight > cssWidth) {
-      scale = (cssWidth * PORTRAIT_WIDTH_FACTOR) / img.naturalWidth;
-      const maxHeight = cssHeight * PORTRAIT_MAX_HEIGHT;
-      if (img.naturalHeight * scale > maxHeight) {
-        scale = maxHeight / img.naturalHeight;
-      }
-    } else {
-      scale =
-        Math.min(cssWidth / img.naturalWidth, cssHeight / img.naturalHeight) * FIT_SCALE;
-    }
-
-    const drawWidth = img.naturalWidth * scale;
-    const drawHeight = img.naturalHeight * scale;
-    // Anchored to the bottom, not centred: the cake stays grounded on the
-    // page, and where the camera crops its base the crop falls off screen.
-    const dx = (cssWidth - drawWidth) / 2;
-    const dy = cssHeight - drawHeight + drawHeight * BOTTOM_OVERSHOOT;
+    const { dx, dy, drawWidth, drawHeight, bands } = getLayout(ctx, cssWidth, cssHeight, dpr);
     ctx.drawImage(img, dx, dy, drawWidth, drawHeight);
-
-    // Dissolve anything the camera cropped at the frame's edges.
-    const right = dx + drawWidth;
-    const bottom = dy + drawHeight;
-    const bands: Array<[number, number, number, number, number[], number[]]> = [
-      // [x, y, w, h, gradient start point, gradient end point]
-      [dx, dy, drawWidth, drawHeight * EDGE_FADE.top, [0, dy + drawHeight * EDGE_FADE.top], [0, dy]],
-      [dx, bottom - drawHeight * EDGE_FADE.bottom, drawWidth, drawHeight * EDGE_FADE.bottom,
-        [0, bottom - drawHeight * EDGE_FADE.bottom], [0, bottom]],
-      [dx, dy, drawWidth * EDGE_FADE.left, drawHeight, [dx + drawWidth * EDGE_FADE.left, 0], [dx, 0]],
-      [right - drawWidth * EDGE_FADE.right, dy, drawWidth * EDGE_FADE.right, drawHeight,
-        [right - drawWidth * EDGE_FADE.right, 0], [right, 0]],
-    ];
 
     ctx.save();
     ctx.globalCompositeOperation = "destination-out";
-    for (const [bx, by, bw, bh, from, to] of bands) {
-      const fade = ctx.createLinearGradient(from[0], from[1], to[0], to[1]);
-      fade.addColorStop(0, "rgba(0,0,0,0)");
-      fade.addColorStop(1, "rgba(0,0,0,1)");
-      ctx.fillStyle = fade;
-      ctx.fillRect(bx, by, bw, bh);
+    for (const band of bands) {
+      ctx.fillStyle = band.gradient;
+      ctx.fillRect(band.x, band.y, band.w, band.h);
     }
     ctx.restore();
-  };
+    return true;
+  }, [getLayout]);
+
+  useEffect(() => {
+    drawFrameRef.current = drawFrame;
+  }, [drawFrame]);
 
   // Scroll-driven frame scrub + checkpoint text reveals.
   useEffect(() => {
     if (!imagesReady) return;
     gsap.registerPlugin(ScrollTrigger);
+    // Without this, ScrollTrigger recalculates the whole pin on the
+    // address-bar-driven resize events mobile browsers fire mid-scroll,
+    // which is a well-known source of stutter/pin-jump on phones.
+    ScrollTrigger.config({ ignoreMobileResize: true });
 
-    drawFrame(0);
+    if (drawFrame(0)) drawnFrameRef.current = 0;
 
     const wrapper = wrapperRef.current;
     if (!wrapper) return;
@@ -208,14 +309,21 @@ export default function ScrollCakeHero() {
       pin: true,
       scrub: 0.4,
       onUpdate: (self) => {
+        // scrub smoothing fires this far more often than the discrete
+        // frame actually advances — redrawing on every tick regardless
+        // was the main source of scroll jank, so only touch the canvas
+        // when there's a new frame to show. targetFrameRef always tracks
+        // what scroll wants; drawnFrameRef only advances on a successful
+        // paint, so a frame whose image hasn't streamed in yet gets
+        // retried (see the preload effect) instead of silently skipped.
         const frame = Math.min(
           FRAME_COUNT - 1,
           Math.floor(self.progress * FRAME_COUNT)
         );
-        if (frame !== currentFrameRef.current) {
-          currentFrameRef.current = frame;
+        targetFrameRef.current = frame;
+        if (frame !== drawnFrameRef.current) {
+          if (drawFrame(frame)) drawnFrameRef.current = frame;
         }
-        drawFrame(frame);
         syncCheckpoints(self.progress);
       },
     });
@@ -223,14 +331,25 @@ export default function ScrollCakeHero() {
     // Paint the resting state so the first line is on screen before any scroll.
     syncCheckpoints(st.progress, true);
 
-    const onResize = () => drawFrame(currentFrameRef.current);
+    // Mobile browsers fire "resize" repeatedly while scrolling, as the
+    // URL bar shows and hides — coalesce bursts of those into one redraw
+    // per frame instead of stacking up several full layout recomputes
+    // during the same scroll gesture.
+    let resizeHandle = 0;
+    const onResize = () => {
+      cancelAnimationFrame(resizeHandle);
+      resizeHandle = requestAnimationFrame(() => {
+        if (drawFrame(targetFrameRef.current)) drawnFrameRef.current = targetFrameRef.current;
+      });
+    };
     window.addEventListener("resize", onResize);
 
     return () => {
       st.kill();
+      cancelAnimationFrame(resizeHandle);
       window.removeEventListener("resize", onResize);
     };
-  }, [imagesReady]);
+  }, [imagesReady, drawFrame]);
 
   // Cursor parallax: the cake tilts and drifts toward the pointer, so it
   // feels dimensional before you ever scroll. Mouse-like pointers only.
