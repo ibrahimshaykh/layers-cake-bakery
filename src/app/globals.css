@@ -30,6 +30,9 @@ body {
   font-family: var(--font-sans), Arial, Helvetica, sans-serif;
 }
 
-html {
-  scroll-behavior: smooth;
-}
+/* No global `scroll-behavior: smooth` here: it fights GSAP ScrollTrigger's
+   own scrub easing on every wheel tick — the browser's native smooth-scroll
+   interpolation and GSAP's RAF-driven updates each try to own the scroll
+   position, and the result is a pinned/scrubbed section that stutters or
+   reads as "stuck" under real mouse-wheel/trackpad input. Nav anchor links
+   get their smooth jump from JS instead (see Nav.tsx). */

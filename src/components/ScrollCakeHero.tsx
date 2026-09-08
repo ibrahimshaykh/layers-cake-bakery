@@ -460,6 +460,13 @@ export default function ScrollCakeHero() {
         </div>
         <a
           href={hero.ctaHref}
+          onClick={(e) => {
+            if (!hero.ctaHref.startsWith("#")) return;
+            const target = document.querySelector(hero.ctaHref);
+            if (!target) return;
+            e.preventDefault();
+            target.scrollIntoView({ behavior: "smooth", block: "start" });
+          }}
           className="rounded-full bg-cocoa px-6 py-3 text-sm font-medium text-cream transition hover:bg-cocoa-light"
         >
           {hero.ctaLabel}
