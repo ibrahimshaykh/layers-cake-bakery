@@ -11,9 +11,10 @@ const FRAME_COUNT = 150;
 // left "Loading the cake…" on screen for several seconds; the rest stream
 // in behind the visible hero instead.
 const EAGER_FRAME_COUNT = 2;
-// How many of the remaining frames to fetch at once. Enough to stay ahead
-// of a scroll, few enough not to saturate the connection.
-const PRELOAD_CONCURRENCY = 8;
+// How many of the remaining frames to fetch at once in the background
+// queue. A fast scroll outrunning this is expected and handled — see
+// ensureFrameLoadingRef — so this only has to be reasonable, not perfect.
+const PRELOAD_CONCURRENCY = 12;
 const PIN_HEIGHT_VH = 320; // scroll distance the sequence plays across
 
 // The cake is drawn "contain"-fit (whole subject always visible) and then
@@ -146,15 +147,36 @@ export default function ScrollCakeHero() {
   // drawFrame exists and only needs to call it when an image arrives late,
   // so it reads through this instead of drawFrame being an effect dep.
   const drawFrameRef = useRef<(index: number) => boolean>(() => false);
+  // Priority-loads a specific frame immediately, ahead of the sequential
+  // background queue. Set once the preload effect below has a real
+  // implementation; see the comment there for why this exists.
+  const ensureFrameLoadingRef = useRef<(index: number) => void>(() => {});
   const [imagesReady, setImagesReady] = useState(false);
 
-  // Preload frames: first N eagerly (gate on these), rest in background.
+  // Preload frames: first N eagerly (gate on these), rest streamed in order
+  // behind the visible hero. Fast scrolling — a real phone flick easily
+  // covers the whole sequence in under a second — can reach a frame long
+  // before that ordered queue gets to it. Measured against the deployed
+  // site: touch-scrolling straight through left the hero frozen on
+  // whatever frame last finished loading for several seconds, well past
+  // where the scroll itself had already gone, because nothing asked for
+  // the actually-needed frame until the queue's linear crawl reached it.
+  // ensureFrameLoading (below) is the fix: a frame the scroll wants but
+  // doesn't have yet gets its own fetch immediately, independent of the
+  // queue's position, so the worst case is one image's fetch+decode time
+  // instead of "however long until the queue works through everything
+  // before it".
   useEffect(() => {
     let cancelled = false;
     const images: HTMLImageElement[] = new Array(FRAME_COUNT);
+    // One promise per index, however it got started (queue or priority),
+    // so neither path ever double-fetches the same frame.
+    const loadPromises: Array<Promise<void> | null> = new Array(FRAME_COUNT).fill(null);
 
-    const loadFrame = (i: number) =>
-      new Promise<void>((resolve) => {
+    const loadFrame = (i: number): Promise<void> => {
+      const existing = loadPromises[i];
+      if (existing) return existing;
+      const promise = new Promise<void>((resolve) => {
         const img = new Image();
         img.src = frameUrl(i);
         const done = () => {
@@ -178,6 +200,51 @@ export default function ScrollCakeHero() {
         img.onerror = () => resolve();
         images[i] = img;
       });
+      loadPromises[i] = promise;
+      return promise;
+    };
+
+    // Single-flight priority fetch. A fast scroll can pass through dozens
+    // of frame indices before any one of them finishes loading; naively
+    // starting a separate priority fetch per index means all of them stay
+    // in flight competing for the same (often slow, mobile) connection,
+    // so the one actually needed once scrolling settles sits queued
+    // behind a pile of ones nobody wants anymore. Instead there's only
+    // ever one priority request outstanding, always for the most recent
+    // target — an older one gets its src cleared (which cancels the
+    // in-flight fetch in every major browser) the moment a newer target
+    // supersedes it.
+    let priorityImg: HTMLImageElement | null = null;
+    let priorityTarget = -1;
+    const priorityLoad = (i: number) => {
+      if (loadPromises[i] || priorityTarget === i) return;
+      if (priorityImg) priorityImg.src = "data:,"; // cancel the superseded fetch (not "" - that re-requests the page URL)
+      priorityTarget = i;
+      const img = new Image();
+      priorityImg = img;
+      img.src = frameUrl(i);
+      const settle = () => {
+        if (priorityTarget === i) priorityTarget = -1;
+      };
+      img.onload = () => {
+        const finish = () => {
+          if (cancelled || priorityTarget !== i) return; // superseded meanwhile
+          images[i] = img;
+          loadPromises[i] = Promise.resolve();
+          if (i === targetFrameRef.current && drawnFrameRef.current !== i) {
+            if (drawFrameRef.current(i)) drawnFrameRef.current = i;
+          }
+          settle();
+        };
+        if (img.decode) img.decode().catch(() => {}).finally(finish);
+        else finish();
+      };
+      img.onerror = settle;
+    };
+
+    ensureFrameLoadingRef.current = (i: number) => {
+      if (!cancelled) priorityLoad(i);
+    };
 
     async function run() {
       const eager = Array.from({ length: EAGER_FRAME_COUNT }, (_, i) => loadFrame(i));
@@ -186,9 +253,9 @@ export default function ScrollCakeHero() {
       imagesRef.current = images;
       setImagesReady(true);
 
-      // Stream the rest in order, a few at a time. Frames that haven't
-      // arrived yet are simply skipped by drawFrame, which holds the last
-      // painted frame rather than blanking the canvas.
+      // Background fill for the ordinary case of scrolling roughly in
+      // order. Frames a fast scroll jumps ahead to are handled by the
+      // priority path above instead of waiting for this to arrive.
       for (let i = EAGER_FRAME_COUNT; i < FRAME_COUNT; i += PRELOAD_CONCURRENCY) {
         if (cancelled) return;
         const batch = [];
@@ -202,6 +269,7 @@ export default function ScrollCakeHero() {
     run();
     return () => {
       cancelled = true;
+      if (priorityImg) priorityImg.src = "data:,";
     };
   }, []);
 
@@ -322,7 +390,14 @@ export default function ScrollCakeHero() {
         );
         targetFrameRef.current = frame;
         if (frame !== drawnFrameRef.current) {
-          if (drawFrame(frame)) drawnFrameRef.current = frame;
+          if (drawFrame(frame)) {
+            drawnFrameRef.current = frame;
+          } else {
+            // This frame's image isn't loaded yet. Fetch it directly
+            // instead of waiting for the background queue to reach it —
+            // on a fast scroll that queue could be 100+ frames behind.
+            ensureFrameLoadingRef.current(frame);
+          }
         }
         syncCheckpoints(self.progress);
       },
@@ -339,7 +414,11 @@ export default function ScrollCakeHero() {
     const onResize = () => {
       cancelAnimationFrame(resizeHandle);
       resizeHandle = requestAnimationFrame(() => {
-        if (drawFrame(targetFrameRef.current)) drawnFrameRef.current = targetFrameRef.current;
+        if (drawFrame(targetFrameRef.current)) {
+          drawnFrameRef.current = targetFrameRef.current;
+        } else {
+          ensureFrameLoadingRef.current(targetFrameRef.current);
+        }
       });
     };
     window.addEventListener("resize", onResize);
