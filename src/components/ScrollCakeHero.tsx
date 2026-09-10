@@ -9,20 +9,26 @@ import { hero } from "@/content/site";
 // rather than 150 because the scroll outran loading at 150 — see the
 // comment there for the measurements.
 const FRAME_COUNT = 80;
-// Windowed loading (see the preload effect for the full reasoning). These
-// bound how much decoded bitmap is resident at once: roughly
+// The decode window (see the loader effect for the full reasoning). These
+// bound how much *decoded* bitmap is resident: roughly
 // (AHEAD + BEHIND + 2*MARGIN) frames, each costing width*height*4 bytes.
 // Hence a profile per set — a resident frame costs 5.8MB at 1600x900 and
-// 2.1MB at 960x540, so the phone can't hold as many of them.
+// 2.1MB at 960x540, so the phone can't hold as many.
 //   desktop: ~32 frames * 5.8MB ~= 185MB
 //   mobile:  ~27 frames * 2.1MB ~=  56MB
-// MARGIN is hysteresis, so frames right at the window edge aren't
-// released and re-fetched repeatedly as the scroll jitters back and forth.
+// AHEAD applies in whichever direction the scroll is travelling, so
+// scrolling up gets the same runway as scrolling down. MARGIN is
+// hysteresis, so frames at the window edge aren't dropped and re-decoded
+// repeatedly as the scroll jitters.
 const WINDOW_DESKTOP = { ahead: 14, behind: 6, margin: 6 };
 const WINDOW_MOBILE = { ahead: 12, behind: 5, margin: 5 };
-const MAX_CONCURRENT_LOADS = 6;
-// How far from the wanted frame to look for an already-loaded one to show
-// instead, when the scroll has outrun loading.
+// Decodes are off-thread and cheap next to a network round trip, so this
+// can be higher than the old network concurrency was.
+const MAX_CONCURRENT_DECODES = 8;
+// How many frames' bytes to fetch in parallel while filling the byte cache.
+const FETCH_CONCURRENCY = 10;
+// How far from the wanted frame to look for an already-decoded one to show
+// instead, when the scroll has outrun decoding.
 const NEAREST_FRAME_SEARCH = 40;
 const PIN_HEIGHT_VH = 320; // scroll distance the sequence plays across
 
@@ -150,37 +156,38 @@ export default function ScrollCakeHero() {
   const requestFrameWindowRef = useRef<() => void>(() => {});
   const [imagesReady, setImagesReady] = useState(false);
 
-  // Frame loading is windowed, not "load all 150 and keep them".
+  // Two stages: get all the bytes, then decode a window of them.
   //
-  // Holding the whole sequence resident costs width*height*4 bytes of
-  // decoded bitmap per frame — ~527MB at 1280x720, or ~132MB even at the
-  // phone size. A desktop absorbs that invisibly, which is exactly why
-  // every desktop test of this looked perfect. A phone can't: iOS Safari
-  // has a hard per-tab memory ceiling well under it, so it evicts frames
-  // and then has to re-decode them mid-scroll, which is what made the
-  // animation stall on a real device.
+  // Stage 1 fetches every frame's compressed bytes into memory. The whole
+  // sequence is only ~5.9MB desktop / ~2.8MB mobile, so this is cheap, and
+  // it takes the network out of the scroll entirely. That matters because
+  // no prefetch window can win against a fast flick: a hard scroll crosses
+  // the whole sequence in about a second, and 80 round trips do not fit in
+  // a second on any connection. Once the bytes are local, the only cost
+  // left is decode.
   //
-  // So instead: keep a window of frames around wherever the scroll is,
-  // load toward it (nearest-first, so the frame actually being shown wins
-  // the race), and release what's far outside it. Released frames come
-  // back from the HTTP cache rather than the network, so scrolling back
-  // costs a decode, not a download. Memory stays bounded no matter how
-  // long the sequence is.
+  // Stage 2 keeps a window of *decoded* frames around the scroll position.
+  // Decoded frames are what cost real memory (5.8MB each at 1600x900,
+  // 2.1MB at 960x540), far too much to hold all of — a phone in particular
+  // will evict and re-decode, which is what made this stall in the first
+  // place. So the window is bounded and releases what it passes, but
+  // refilling it now only needs a decode from a local blob, no request.
+  //
+  // The window follows the direction of travel. It used to be fixed at 14
+  // ahead / 6 behind, which left scrolling *up* with less than half the
+  // runway of scrolling down — reported as reverse being noticeably worse.
   useEffect(() => {
     let cancelled = false;
+    const blobs: Array<Blob | undefined> = new Array(FRAME_COUNT);
     const frames: Array<FrameSource | undefined> = new Array(FRAME_COUNT);
-    // 0 = not loaded, 1 = in flight, 2 = ready
+    // 0 = not decoded, 1 = decoding, 2 = ready
     const state = new Uint8Array(FRAME_COUNT);
-    let inFlight = 0;
+    let decoding = 0;
+    let lastTarget = 0;
+    // +1 scrolling down the sequence, -1 scrolling back up.
+    let direction = 1;
 
     const release = (i: number) => {
-      // In-flight loads are deliberately left to finish rather than
-      // aborted when the window moves off them. Cancelling them was tried
-      // and is much worse: during a continuous scroll the window moves
-      // faster than a frame can arrive, so essentially every load got
-      // cancelled just before completing and the sequence showed 7 frames
-      // instead of ~50. A frame that lands late still feeds the
-      // nearest-available fallback.
       if (state[i] !== 2) return;
       const frame = frames[i];
       // close() frees the decoded pixels immediately and deterministically.
@@ -189,86 +196,17 @@ export default function ScrollCakeHero() {
       state[i] = 0;
     };
 
-    const startLoad = (i: number) => {
-      if (cancelled || state[i] !== 0) return;
-      state[i] = 1;
-      inFlight++;
-      let settled = false;
-      const settle = () => {
-        if (settled) return false;
-        settled = true;
-        inFlight--;
-        return true;
-      };
-      const succeed = (frame: FrameSource) => {
-        if (!settle()) return;
-        if (cancelled || state[i] !== 1) {
-          if ("close" in frame) frame.close();
-          return;
-        }
-        frames[i] = frame;
-        state[i] = 2;
-        // The resting frame is all the hero waits on before revealing.
-        if (i === 0) setImagesReady(true);
-        // Repaint if this arrival is a better match for where the scroll
-        // is now than whatever is currently on the canvas.
-        paintBestAvailable();
-        pump();
-      };
-      const fail = () => {
-        if (!settle()) return;
-        if (state[i] === 1) state[i] = 0;
-        if (cancelled) return;
-        // Frame 0 gates the reveal, so a blip there can't be left alone or
-        // the hero sits behind its loading state indefinitely.
-        if (i === 0) window.setTimeout(() => !cancelled && startLoad(0), 500);
-        pump();
-      };
-
-      // Fetch + createImageBitmap rather than an <img>.
-      //
-      // These sources are never attached to the document, and Chromium is
-      // free to throw away the decoded pixels of an unattached image — so
-      // every drawImage paid a fresh WebP-with-alpha decode on the main
-      // thread. Measured: stubbing out the draw dropped p90 frame time
-      // from 131ms to 19ms under 4x CPU throttle, while shrinking the
-      // canvas barely moved it, which put the cost squarely on the source
-      // side. An ImageBitmap is decoded once, off the main thread, and
-      // stays decoded until closed.
-      if (typeof createImageBitmap === "function") {
-        fetch(frameUrl(i))
-          .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(String(res.status)))))
-          .then((blob) => createImageBitmap(blob))
-          .then(succeed)
-          .catch(fail);
-        return;
-      }
-
-      const img = new Image();
-      img.src = frameUrl(i);
-      img.onload = () => {
-        if (img.decode) img.decode().catch(() => {}).finally(() => succeed(img));
-        else succeed(img);
-      };
-      img.onerror = fail;
-    };
-
-    // Draw the closest frame to the target that's actually loaded.
-    //
-    // On a slow connection the scroll routinely outruns loading — 150
-    // frames can't all arrive during a few seconds of scrolling. Drawing
-    // only on an exact hit means the hero freezes on whichever frame last
-    // landed, which is exactly what "stuck" looked like. Showing the
-    // nearest available frame instead keeps the cake tracking the scroll,
-    // just at coarser granularity, and it sharpens up as frames arrive.
+    // Draw the closest frame to the target that's actually decoded.
+    // Without this the hero freezes on whichever frame last landed
+    // whenever the scroll gets ahead of decoding; showing the nearest
+    // available frame keeps the cake tracking the scroll, just coarsely,
+    // and it sharpens as frames land.
     function paintBestAvailable() {
       if (cancelled) return;
       const target = targetFrameRef.current;
       const drawn = drawnFrameRef.current;
-      // Don't let the substitute frame run against the scroll: while
-      // scrolling forward, only consider frames at or ahead of what's
-      // already shown (and vice versa). Otherwise a gap in what's loaded
-      // makes the cake visibly jump backwards mid-scroll.
+      // Never let the substitute run against the scroll, or a gap in
+      // what's decoded makes the cake visibly jump backwards.
       const forward = target >= drawn;
       for (let d = 0; d <= NEAREST_FRAME_SEARCH; d++) {
         const ahead = target + d;
@@ -285,48 +223,127 @@ export default function ScrollCakeHero() {
       }
     }
 
-    // Keep the window around the current target filled and drop the rest.
-    // Nearest-first ordering matters more than raw throughput here: on a
-    // fast flick the target moves constantly, and what must win is the
-    // frame currently on screen, not the 40 the scroll already passed.
-    function pump() {
+    const startDecode = (i: number) => {
+      if (cancelled || state[i] !== 0 || !blobs[i]) return;
+      state[i] = 1;
+      decoding++;
+      let settled = false;
+      const settle = () => {
+        if (settled) return false;
+        settled = true;
+        decoding--;
+        return true;
+      };
+      const succeed = (frame: FrameSource) => {
+        if (!settle()) return;
+        if (cancelled || state[i] !== 1) {
+          if ("close" in frame) frame.close();
+          return;
+        }
+        frames[i] = frame;
+        state[i] = 2;
+        if (i === 0) setImagesReady(true);
+        paintBestAvailable();
+        pumpDecode();
+      };
+      const fail = () => {
+        if (!settle()) return;
+        if (state[i] === 1) state[i] = 0;
+        if (!cancelled) pumpDecode();
+      };
+
+      // An ImageBitmap is decoded once, off the main thread, and stays
+      // decoded until closed — unlike a detached <img>, whose decoded
+      // pixels Chromium is free to discard, making every drawImage pay a
+      // fresh WebP-with-alpha decode.
+      if (typeof createImageBitmap === "function") {
+        createImageBitmap(blobs[i] as Blob).then(succeed).catch(fail);
+        return;
+      }
+      const img = new Image();
+      const url = URL.createObjectURL(blobs[i] as Blob);
+      img.src = url;
+      img.onload = () => {
+        const done = () => {
+          URL.revokeObjectURL(url);
+          succeed(img);
+        };
+        if (img.decode) img.decode().catch(() => {}).finally(done);
+        else done();
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        fail();
+      };
+    };
+
+    // Keep the decode window filled in the direction of travel, and drop
+    // what's outside it.
+    function pumpDecode() {
       if (cancelled) return;
       const target = targetFrameRef.current;
       const win = frameWindow();
+      const ahead = direction >= 0 ? win.ahead : win.behind;
+      const behind = direction >= 0 ? win.behind : win.ahead;
 
-      const keepLo = Math.max(0, target - win.behind - win.margin);
-      const keepHi = Math.min(FRAME_COUNT - 1, target + win.ahead + win.margin);
+      const keepLo = Math.max(0, target - behind - win.margin);
+      const keepHi = Math.min(FRAME_COUNT - 1, target + ahead + win.margin);
       for (let i = 0; i < FRAME_COUNT; i++) {
         if (i < keepLo || i > keepHi) release(i);
       }
 
-      // Nearest-first, and always inside the concurrency cap — including
-      // for the target itself. Letting the target bypass the cap was
-      // tried: because pump() runs on every frame change, it spawned a
-      // fresh request per change and saturated a slow link, which cut the
-      // sequence from ~50 frames to ~20. The cap is what keeps the
-      // connection usable, so the target's priority comes from being
-      // first in this ordering, not from being exempt.
-      for (let d = 0; d <= win.ahead; d++) {
-        if (inFlight >= MAX_CONCURRENT_LOADS) return;
-        const ahead = target + d;
-        if (ahead < FRAME_COUNT) startLoad(ahead);
+      const reach = Math.max(ahead, behind);
+      for (let d = 0; d <= reach; d++) {
+        if (decoding >= MAX_CONCURRENT_DECODES) return;
+        const fwd = target + (direction >= 0 ? d : -d);
+        if (d <= ahead && fwd >= 0 && fwd < FRAME_COUNT) startDecode(fwd);
         if (d === 0) continue;
-        if (inFlight >= MAX_CONCURRENT_LOADS) return;
-        const behind = target - d;
-        if (d <= win.behind && behind >= 0) startLoad(behind);
+        if (decoding >= MAX_CONCURRENT_DECODES) return;
+        const back = target - (direction >= 0 ? d : -d);
+        if (d <= behind && back >= 0 && back < FRAME_COUNT) startDecode(back);
       }
     }
 
     requestFrameWindowRef.current = () => {
+      const target = targetFrameRef.current;
+      if (target !== lastTarget) {
+        direction = target > lastTarget ? 1 : -1;
+        lastTarget = target;
+      }
       paintBestAvailable();
-      pump();
+      pumpDecode();
     };
 
     framesRef.current = frames;
-    // Gate the hero on just the resting frame, then let the window fill in
-    // behind it (startLoad's finish() flips imagesReady and pumps).
-    startLoad(0);
+
+    // Stage 1. Frame 0 first so the hero can reveal as early as possible,
+    // then the rest in parallel batches.
+    const fetchFrame = (i: number) =>
+      fetch(frameUrl(i))
+        .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(String(res.status)))))
+        .then((blob) => {
+          if (cancelled) return;
+          blobs[i] = blob;
+          // Decode straight away if the scroll already wants this one.
+          if (Math.abs(i - targetFrameRef.current) <= 1) startDecode(i);
+        })
+        .catch(() => {});
+
+    (async () => {
+      await fetchFrame(0);
+      if (cancelled) return;
+      startDecode(0);
+      pumpDecode();
+      for (let i = 1; i < FRAME_COUNT; i += FETCH_CONCURRENCY) {
+        if (cancelled) return;
+        const batch = [];
+        for (let j = i; j < Math.min(i + FETCH_CONCURRENCY, FRAME_COUNT); j++) {
+          batch.push(fetchFrame(j));
+        }
+        await Promise.all(batch);
+        pumpDecode();
+      }
+    })();
 
     return () => {
       cancelled = true;
@@ -445,7 +462,14 @@ export default function ScrollCakeHero() {
       start: "top top",
       end: `+=${PIN_HEIGHT_VH}%`,
       pin: true,
-      scrub: 0.4,
+      // Near 1:1 with the scroll. This was 0.4, which is 0.4s of easing
+      // between the scroll and the animation: measured at 246ms of the
+      // cake still catching up *after* a fast flick had already stopped.
+      // On a hard scroll — in either direction — that reads as the cake
+      // lagging behind and then snapping, which is what "stucks when I
+      // scroll fast" was describing. Small enough to still absorb
+      // wheel-tick jitter, short enough not to feel detached.
+      scrub: 0.12,
       onUpdate: (self) => {
         // scrub smoothing fires this far more often than the discrete
         // frame actually advances — redrawing on every tick regardless
