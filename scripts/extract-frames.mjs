@@ -35,7 +35,16 @@ const OUT_DIR = path.join(projectRoot, "public", "frames");
 
 // The whole take, start to finish.
 const CLIP_END = 10;
-const FORWARD_FRAMES = 150;
+// 80, not 150. 150 frames at these resolutions is ~11MB, and measurement
+// on the deployed site showed the scroll simply outruns it: only 66 of
+// 150 frames ever reached the screen on a 10Mbps link, and 114 of 150 even
+// unthrottled — the cake visibly froze while the scroll and the text
+// carried on, because text costs nothing to "load" and a frame costs
+// ~76KB. The reference site this is modelled on uses 67 frames / 7.4MB
+// total, which is the honest budget for a scroll-scrubbed sequence. At 80
+// frames each one also stays on screen twice as long, so loading has twice
+// as long to keep up.
+const FORWARD_FRAMES = 80;
 // Matte at the source's native resolution — the video is 1920x1080, and
 // keying before any downscale avoids matting interpolated edge pixels.
 // Both output sets are then scaled down from this.

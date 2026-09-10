@@ -5,7 +5,10 @@ import gsap from "gsap";
 import ScrollTrigger from "gsap/ScrollTrigger";
 import { hero } from "@/content/site";
 
-const FRAME_COUNT = 150;
+// Must match FORWARD_FRAMES in scripts/extract-frames.mjs. Kept at 80
+// rather than 150 because the scroll outran loading at 150 — see the
+// comment there for the measurements.
+const FRAME_COUNT = 80;
 // Windowed loading (see the preload effect for the full reasoning). These
 // bound how much decoded bitmap is resident at once: roughly
 // (AHEAD + BEHIND + 2*MARGIN) frames, each costing width*height*4 bytes.
