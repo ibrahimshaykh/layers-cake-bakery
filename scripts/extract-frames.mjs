@@ -36,15 +36,37 @@ const OUT_DIR = path.join(projectRoot, "public", "frames");
 // The whole take, start to finish.
 const CLIP_END = 10;
 const FORWARD_FRAMES = 150;
-const WIDTH = 1280;
-const HEIGHT = 720;
-// Phone-sized variant, written alongside the full-size set — see the
-// comment at the encode step for why this exists (decoded-memory budget,
-// not download size).
+// Matte at the source's native resolution — the video is 1920x1080, and
+// keying before any downscale avoids matting interpolated edge pixels.
+// Both output sets are then scaled down from this.
+const WIDTH = 1920;
+const HEIGHT = 1080;
+// Delivered sets. Both are 16:9 like the source, so the hero's layout
+// math (which works from the aspect ratio, not the pixel dimensions) is
+// identical for either.
+//
+// These sizes are a sharpness-vs-decoded-memory trade. The canvas draws
+// the frame at roughly the viewport width, times the device pixel ratio:
+// ~2500 device px on a Retina laptop, ~1560 on a 390pt phone at DPR 2.
+// The previous 1280 / 640 sets were upscaled ~2x into that and looked
+// soft. These land much closer to native while keeping the resident
+// window affordable (see the window constants in ScrollCakeHero).
+const DESKTOP_WIDTH = 1600;
+const DESKTOP_HEIGHT = 900;
 const MOBILE_OUT_DIR = path.join(projectRoot, "public", "frames-mobile");
-const MOBILE_WIDTH = 640;
-const MOBILE_HEIGHT = 360;
-const WEBP_QUALITY = 78;
+const MOBILE_WIDTH = 960;
+const MOBILE_HEIGHT = 540;
+// 82, not higher: at these resolutions the sharpness win comes almost
+// entirely from the pixel count, while quality 90 nearly doubled file size
+// (93KB/frame desktop). Bigger frames take longer to arrive, and a loader
+// that can't keep up with the scroll is the worse failure — that was the
+// original "stuck" complaint.
+const WEBP_QUALITY = 82;
+// Phones are the tight case: measured on a 1.6Mbps/150ms link, 41KB frames
+// left the sequence ~4s behind a full-speed scroll. Resolution is what
+// actually makes it look sharper, so keep the pixels and spend less per
+// pixel here rather than shipping a smaller frame.
+const MOBILE_QUALITY = 72;
 
 // Matte tuning. Differences below DEAD_ZONE are backdrop noise; differences
 // at or above FULL_OPAQUE are solid subject. The subject is darker than the
@@ -280,12 +302,13 @@ async function main() {
     rmSync(OUT_DIR, { recursive: true, force: true });
     mkdirSync(OUT_DIR, { recursive: true });
 
-    console.log(`Encoding ${available} transparent WebP frames...`);
+    console.log(`Encoding ${available} transparent WebP frames (${DESKTOP_WIDTH}x${DESKTOP_HEIGHT})...`);
     await execFileAsync(ffmpegPath, [
       "-y", "-v", "error",
       "-f", "rawvideo", "-pix_fmt", "rgba",
       "-s", `${WIDTH}x${HEIGHT}`,
       "-i", rgbaPath,
+      "-vf", `scale=${DESKTOP_WIDTH}:${DESKTOP_HEIGHT}:flags=lanczos`,
       "-c:v", "libwebp",
       "-quality", String(WEBP_QUALITY),
       "-preset", "photo",
@@ -312,7 +335,7 @@ async function main() {
       "-i", rgbaPath,
       "-vf", `scale=${MOBILE_WIDTH}:${MOBILE_HEIGHT}:flags=lanczos`,
       "-c:v", "libwebp",
-      "-quality", String(WEBP_QUALITY),
+      "-quality", String(MOBILE_QUALITY),
       "-preset", "photo",
       path.join(MOBILE_OUT_DIR, "frame-%03d.webp"),
     ]);

@@ -8,12 +8,15 @@ import { hero } from "@/content/site";
 const FRAME_COUNT = 150;
 // Windowed loading (see the preload effect for the full reasoning). These
 // bound how much decoded bitmap is resident at once: roughly
-// (AHEAD + BEHIND + 2*MARGIN) * width * height * 4 bytes.
-const WINDOW_AHEAD = 30;
-const WINDOW_BEHIND = 12;
-// Hysteresis, so frames right at the window edge aren't released and
-// re-fetched repeatedly as the scroll jitters back and forth.
-const WINDOW_RELEASE_MARGIN = 15;
+// (AHEAD + BEHIND + 2*MARGIN) frames, each costing width*height*4 bytes.
+// Hence a profile per set — a resident frame costs 5.8MB at 1600x900 and
+// 2.1MB at 960x540, so the phone can't hold as many of them.
+//   desktop: ~32 frames * 5.8MB ~= 185MB
+//   mobile:  ~27 frames * 2.1MB ~=  56MB
+// MARGIN is hysteresis, so frames right at the window edge aren't
+// released and re-fetched repeatedly as the scroll jitters back and forth.
+const WINDOW_DESKTOP = { ahead: 14, behind: 6, margin: 6 };
+const WINDOW_MOBILE = { ahead: 12, behind: 5, margin: 5 };
 const MAX_CONCURRENT_LOADS = 6;
 // How far from the wanted frame to look for an already-loaded one to show
 // instead, when the scroll has outrun loading.
@@ -54,25 +57,29 @@ const BOTTOM_OVERSHOOT = 0.04;
 // a bandwidth one — see the preload effect below. Kept in sync with the
 // matching <link rel="preload" media=...> hints in app/layout.tsx.
 const SMALL_SCREEN_QUERY = "(max-width: 820px)";
-let frameDirCache: string | null = null;
-function frameDir() {
-  if (frameDirCache) return frameDirCache;
-  const small =
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia(SMALL_SCREEN_QUERY).matches;
-  frameDirCache = small ? "/frames-mobile" : "/frames";
-  return frameDirCache;
+let onSmallScreenCache: boolean | null = null;
+function onSmallScreen() {
+  if (onSmallScreenCache === null) {
+    onSmallScreenCache =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia(SMALL_SCREEN_QUERY).matches;
+  }
+  return onSmallScreenCache;
 }
 
 function frameUrl(index: number) {
   const n = String(index + 1).padStart(3, "0");
-  return `${frameDir()}/frame-${n}.webp`;
+  return `${onSmallScreen() ? "/frames-mobile" : "/frames"}/frame-${n}.webp`;
 }
 
-// Every extracted frame is decoded at this fixed size (see
-// scripts/extract-frames.mjs), so layout math never needs to touch an
-// actual <img> — it's the same for frame 1 and frame 150.
+function frameWindow() {
+  return onSmallScreen() ? WINDOW_MOBILE : WINDOW_DESKTOP;
+}
+
+// Both frame sets are 16:9 like the source, so this is only ever used as
+// an aspect ratio — the layout is identical whichever set is in play, and
+// it never has to touch an actual <img> to work it out.
 const NATIVE_WIDTH = 1280;
 const NATIVE_HEIGHT = 720;
 
@@ -195,6 +202,14 @@ export default function ScrollCakeHero() {
     let inFlight = 0;
 
     const release = (i: number) => {
+      // In-flight loads are deliberately left to finish rather than
+      // aborted when the window moves off them. Cancelling them was tried
+      // and is much worse: during a continuous scroll the window moves
+      // faster than a frame can arrive, so essentially every load got
+      // cancelled just before completing and the sequence showed 7 frames
+      // instead of ~50. A frame that lands late still feeds the
+      // nearest-available fallback. Starvation of the on-screen frame is
+      // instead solved by letting the target bypass the cap — see pump().
       if (state[i] !== 2) return;
       const img = images[i];
       if (img) {
@@ -298,21 +313,29 @@ export default function ScrollCakeHero() {
     function pump() {
       if (cancelled) return;
       const target = targetFrameRef.current;
+      const win = frameWindow();
 
-      const keepLo = Math.max(0, target - WINDOW_BEHIND - WINDOW_RELEASE_MARGIN);
-      const keepHi = Math.min(FRAME_COUNT - 1, target + WINDOW_AHEAD + WINDOW_RELEASE_MARGIN);
+      const keepLo = Math.max(0, target - win.behind - win.margin);
+      const keepHi = Math.min(FRAME_COUNT - 1, target + win.ahead + win.margin);
       for (let i = 0; i < FRAME_COUNT; i++) {
         if (i < keepLo || i > keepHi) release(i);
       }
 
-      for (let d = 0; d <= WINDOW_AHEAD; d++) {
+      // Nearest-first, and always inside the concurrency cap — including
+      // for the target itself. Letting the target bypass the cap was
+      // tried: because pump() runs on every frame change, it spawned a
+      // fresh request per change and saturated a slow link, which cut the
+      // sequence from ~50 frames to ~20. The cap is what keeps the
+      // connection usable, so the target's priority comes from being
+      // first in this ordering, not from being exempt.
+      for (let d = 0; d <= win.ahead; d++) {
         if (inFlight >= MAX_CONCURRENT_LOADS) return;
         const ahead = target + d;
         if (ahead < FRAME_COUNT) startLoad(ahead);
         if (d === 0) continue;
         if (inFlight >= MAX_CONCURRENT_LOADS) return;
         const behind = target - d;
-        if (d <= WINDOW_BEHIND && behind >= 0) startLoad(behind);
+        if (d <= win.behind && behind >= 0) startLoad(behind);
       }
     }
 
