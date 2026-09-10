@@ -38,6 +38,12 @@ const CLIP_END = 10;
 const FORWARD_FRAMES = 150;
 const WIDTH = 1280;
 const HEIGHT = 720;
+// Phone-sized variant, written alongside the full-size set — see the
+// comment at the encode step for why this exists (decoded-memory budget,
+// not download size).
+const MOBILE_OUT_DIR = path.join(projectRoot, "public", "frames-mobile");
+const MOBILE_WIDTH = 640;
+const MOBILE_HEIGHT = 360;
 const WEBP_QUALITY = 78;
 
 // Matte tuning. Differences below DEAD_ZONE are backdrop noise; differences
@@ -286,7 +292,32 @@ async function main() {
       path.join(OUT_DIR, "frame-%03d.webp"),
     ]);
 
-    console.log(`Done. ${available} frames written to ${OUT_DIR}`);
+    // Phone-sized variant. What matters here is not download size — the
+    // frames are already small — but *decoded* size. A browser holding
+    // this sequence resident costs width*height*4 bytes per frame: at
+    // 1280x720 that's ~527MB for the full set, which a desktop absorbs
+    // silently and a phone cannot. iOS Safari in particular has a hard
+    // per-tab memory ceiling well below that, so it evicts frames and
+    // has to re-decode them mid-scroll — which is what makes the
+    // animation stall on a real device while looking perfect in desktop
+    // testing. At MOBILE_WIDTH the same set is ~4x cheaper to hold.
+    rmSync(MOBILE_OUT_DIR, { recursive: true, force: true });
+    mkdirSync(MOBILE_OUT_DIR, { recursive: true });
+
+    console.log(`Encoding ${available} phone-sized frames (${MOBILE_WIDTH}x${MOBILE_HEIGHT})...`);
+    await execFileAsync(ffmpegPath, [
+      "-y", "-v", "error",
+      "-f", "rawvideo", "-pix_fmt", "rgba",
+      "-s", `${WIDTH}x${HEIGHT}`,
+      "-i", rgbaPath,
+      "-vf", `scale=${MOBILE_WIDTH}:${MOBILE_HEIGHT}:flags=lanczos`,
+      "-c:v", "libwebp",
+      "-quality", String(WEBP_QUALITY),
+      "-preset", "photo",
+      path.join(MOBILE_OUT_DIR, "frame-%03d.webp"),
+    ]);
+
+    console.log(`Done. ${available} frames written to ${OUT_DIR} and ${MOBILE_OUT_DIR}`);
     console.log(`Set FRAME_COUNT in ScrollCakeHero.tsx to ${available}.`);
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });

@@ -6,15 +6,18 @@ import ScrollTrigger from "gsap/ScrollTrigger";
 import { hero } from "@/content/site";
 
 const FRAME_COUNT = 150;
-// Only the frames actually needed to paint the resting hero are gated on.
-// Each frame is ~30KB and cold TTFB runs ~0.6s, so waiting on a big batch
-// left "Loading the cake…" on screen for several seconds; the rest stream
-// in behind the visible hero instead.
-const EAGER_FRAME_COUNT = 2;
-// How many of the remaining frames to fetch at once in the background
-// queue. A fast scroll outrunning this is expected and handled — see
-// ensureFrameLoadingRef — so this only has to be reasonable, not perfect.
-const PRELOAD_CONCURRENCY = 12;
+// Windowed loading (see the preload effect for the full reasoning). These
+// bound how much decoded bitmap is resident at once: roughly
+// (AHEAD + BEHIND + 2*MARGIN) * width * height * 4 bytes.
+const WINDOW_AHEAD = 30;
+const WINDOW_BEHIND = 12;
+// Hysteresis, so frames right at the window edge aren't released and
+// re-fetched repeatedly as the scroll jitters back and forth.
+const WINDOW_RELEASE_MARGIN = 15;
+const MAX_CONCURRENT_LOADS = 6;
+// How far from the wanted frame to look for an already-loaded one to show
+// instead, when the scroll has outrun loading.
+const NEAREST_FRAME_SEARCH = 40;
 const PIN_HEIGHT_VH = 320; // scroll distance the sequence plays across
 
 // The cake is drawn "contain"-fit (whole subject always visible) and then
@@ -47,9 +50,24 @@ const BOTTOM_OVERSHOOT = 0.04;
 // before the camera actually cropped it — undoing the exact moment the
 // push-in is meant to deliver.
 
+// Phones get the smaller frame set. This is a decoded-memory decision, not
+// a bandwidth one — see the preload effect below. Kept in sync with the
+// matching <link rel="preload" media=...> hints in app/layout.tsx.
+const SMALL_SCREEN_QUERY = "(max-width: 820px)";
+let frameDirCache: string | null = null;
+function frameDir() {
+  if (frameDirCache) return frameDirCache;
+  const small =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(SMALL_SCREEN_QUERY).matches;
+  frameDirCache = small ? "/frames-mobile" : "/frames";
+  return frameDirCache;
+}
+
 function frameUrl(index: number) {
   const n = String(index + 1).padStart(3, "0");
-  return `/frames/frame-${n}.webp`;
+  return `${frameDir()}/frame-${n}.webp`;
 }
 
 // Every extracted frame is decoded at this fixed size (see
@@ -147,129 +165,170 @@ export default function ScrollCakeHero() {
   // drawFrame exists and only needs to call it when an image arrives late,
   // so it reads through this instead of drawFrame being an effect dep.
   const drawFrameRef = useRef<(index: number) => boolean>(() => false);
-  // Priority-loads a specific frame immediately, ahead of the sequential
-  // background queue. Set once the preload effect below has a real
-  // implementation; see the comment there for why this exists.
-  const ensureFrameLoadingRef = useRef<(index: number) => void>(() => {});
+  // Nudges the loader to re-evaluate its window against wherever the scroll
+  // now is (it reads targetFrameRef itself, so it needs no argument). Set
+  // once the preload effect below has a real implementation.
+  const requestFrameWindowRef = useRef<() => void>(() => {});
   const [imagesReady, setImagesReady] = useState(false);
 
-  // Preload frames: first N eagerly (gate on these), rest streamed in order
-  // behind the visible hero. Fast scrolling — a real phone flick easily
-  // covers the whole sequence in under a second — can reach a frame long
-  // before that ordered queue gets to it. Measured against the deployed
-  // site: touch-scrolling straight through left the hero frozen on
-  // whatever frame last finished loading for several seconds, well past
-  // where the scroll itself had already gone, because nothing asked for
-  // the actually-needed frame until the queue's linear crawl reached it.
-  // ensureFrameLoading (below) is the fix: a frame the scroll wants but
-  // doesn't have yet gets its own fetch immediately, independent of the
-  // queue's position, so the worst case is one image's fetch+decode time
-  // instead of "however long until the queue works through everything
-  // before it".
+  // Frame loading is windowed, not "load all 150 and keep them".
+  //
+  // Holding the whole sequence resident costs width*height*4 bytes of
+  // decoded bitmap per frame — ~527MB at 1280x720, or ~132MB even at the
+  // phone size. A desktop absorbs that invisibly, which is exactly why
+  // every desktop test of this looked perfect. A phone can't: iOS Safari
+  // has a hard per-tab memory ceiling well under it, so it evicts frames
+  // and then has to re-decode them mid-scroll, which is what made the
+  // animation stall on a real device.
+  //
+  // So instead: keep a window of frames around wherever the scroll is,
+  // load toward it (nearest-first, so the frame actually being shown wins
+  // the race), and release what's far outside it. Released frames come
+  // back from the HTTP cache rather than the network, so scrolling back
+  // costs a decode, not a download. Memory stays bounded no matter how
+  // long the sequence is.
   useEffect(() => {
     let cancelled = false;
-    const images: HTMLImageElement[] = new Array(FRAME_COUNT);
-    // One promise per index, however it got started (queue or priority),
-    // so neither path ever double-fetches the same frame.
-    const loadPromises: Array<Promise<void> | null> = new Array(FRAME_COUNT).fill(null);
+    const images: Array<HTMLImageElement | undefined> = new Array(FRAME_COUNT);
+    // 0 = not loaded, 1 = in flight, 2 = ready
+    const state = new Uint8Array(FRAME_COUNT);
+    let inFlight = 0;
 
-    const loadFrame = (i: number): Promise<void> => {
-      const existing = loadPromises[i];
-      if (existing) return existing;
-      const promise = new Promise<void>((resolve) => {
-        const img = new Image();
-        img.src = frameUrl(i);
-        const done = () => {
-          // Decode off the main thread so the first draw of this frame
-          // doesn't stall on it — otherwise a scroll that reaches a
-          // freshly-arrived frame can visibly hitch on decode.
-          const finish = () => {
-            // If the scroll is already sitting on this frame and it
-            // couldn't paint earlier because this exact image wasn't
-            // ready, paint it now instead of leaving the hero stuck on
-            // whatever last successfully drew.
-            if (i === targetFrameRef.current && drawnFrameRef.current !== i) {
-              if (drawFrameRef.current(i)) drawnFrameRef.current = i;
-            }
-            resolve();
-          };
-          if (img.decode) img.decode().catch(() => {}).finally(finish);
-          else finish();
-        };
-        img.onload = done;
-        img.onerror = () => resolve();
-        images[i] = img;
-      });
-      loadPromises[i] = promise;
-      return promise;
+    const release = (i: number) => {
+      if (state[i] !== 2) return;
+      const img = images[i];
+      if (img) {
+        // Detach first. Clearing src re-fires load/error handlers on an
+        // already-loaded image, and those handlers adjust inFlight — left
+        // attached, every release double-decremented the counter until it
+        // went negative, the concurrency cap stopped capping, and the
+        // loader flooded the connection so the frame actually on screen
+        // never got bandwidth. That was the stall.
+        img.onload = null;
+        img.onerror = null;
+        // Dropping the reference alone doesn't reliably free the decoded
+        // bitmap; clearing src does. "data:," rather than "" because an
+        // empty relative src re-resolves to the current page URL.
+        img.src = "data:,";
+      }
+      images[i] = undefined;
+      state[i] = 0;
     };
 
-    // Single-flight priority fetch. A fast scroll can pass through dozens
-    // of frame indices before any one of them finishes loading; naively
-    // starting a separate priority fetch per index means all of them stay
-    // in flight competing for the same (often slow, mobile) connection,
-    // so the one actually needed once scrolling settles sits queued
-    // behind a pile of ones nobody wants anymore. Instead there's only
-    // ever one priority request outstanding, always for the most recent
-    // target — an older one gets its src cleared (which cancels the
-    // in-flight fetch in every major browser) the moment a newer target
-    // supersedes it.
-    let priorityImg: HTMLImageElement | null = null;
-    let priorityTarget = -1;
-    const priorityLoad = (i: number) => {
-      if (loadPromises[i] || priorityTarget === i) return;
-      if (priorityImg) priorityImg.src = "data:,"; // cancel the superseded fetch (not "" - that re-requests the page URL)
-      priorityTarget = i;
+    const startLoad = (i: number) => {
+      if (cancelled || state[i] !== 0) return;
+      state[i] = 1;
+      inFlight++;
       const img = new Image();
-      priorityImg = img;
-      img.src = frameUrl(i);
+      images[i] = img;
+      // One-shot guard: whatever happens to this element later (including
+      // a src change), this particular load settles the counter once.
+      let settled = false;
       const settle = () => {
-        if (priorityTarget === i) priorityTarget = -1;
+        if (settled) return false;
+        settled = true;
+        inFlight--;
+        return true;
+      };
+      img.src = frameUrl(i);
+      const finish = () => {
+        if (!settle()) return;
+        if (cancelled) return;
+        if (state[i] !== 1) return; // released while in flight
+        state[i] = 2;
+        // The resting frame is all the hero waits on before revealing.
+        if (i === 0) setImagesReady(true);
+        // Repaint if this arrival is a better match for where the scroll
+        // is now than whatever is currently on the canvas.
+        paintBestAvailable();
+        pump();
       };
       img.onload = () => {
-        const finish = () => {
-          if (cancelled || priorityTarget !== i) return; // superseded meanwhile
-          images[i] = img;
-          loadPromises[i] = Promise.resolve();
-          if (i === targetFrameRef.current && drawnFrameRef.current !== i) {
-            if (drawFrameRef.current(i)) drawnFrameRef.current = i;
-          }
-          settle();
-        };
+        // Decode up front so the first draw of this frame doesn't stall.
         if (img.decode) img.decode().catch(() => {}).finally(finish);
         else finish();
       };
-      img.onerror = settle;
-    };
-
-    ensureFrameLoadingRef.current = (i: number) => {
-      if (!cancelled) priorityLoad(i);
-    };
-
-    async function run() {
-      const eager = Array.from({ length: EAGER_FRAME_COUNT }, (_, i) => loadFrame(i));
-      await Promise.all(eager);
-      if (cancelled) return;
-      imagesRef.current = images;
-      setImagesReady(true);
-
-      // Background fill for the ordinary case of scrolling roughly in
-      // order. Frames a fast scroll jumps ahead to are handled by the
-      // priority path above instead of waiting for this to arrive.
-      for (let i = EAGER_FRAME_COUNT; i < FRAME_COUNT; i += PRELOAD_CONCURRENCY) {
+      img.onerror = () => {
+        if (!settle()) return;
+        if (state[i] === 1) state[i] = 0;
         if (cancelled) return;
-        const batch = [];
-        for (let j = i; j < Math.min(i + PRELOAD_CONCURRENCY, FRAME_COUNT); j++) {
-          batch.push(loadFrame(j));
+        // Frame 0 gates the reveal, so a blip there can't be left alone or
+        // the hero sits behind its loading state indefinitely.
+        if (i === 0) window.setTimeout(() => !cancelled && startLoad(0), 500);
+        pump();
+      };
+    };
+
+    // Draw the closest frame to the target that's actually loaded.
+    //
+    // On a slow connection the scroll routinely outruns loading — 150
+    // frames can't all arrive during a few seconds of scrolling. Drawing
+    // only on an exact hit means the hero freezes on whichever frame last
+    // landed, which is exactly what "stuck" looked like. Showing the
+    // nearest available frame instead keeps the cake tracking the scroll,
+    // just at coarser granularity, and it sharpens up as frames arrive.
+    function paintBestAvailable() {
+      if (cancelled) return;
+      const target = targetFrameRef.current;
+      const drawn = drawnFrameRef.current;
+      // Don't let the substitute frame run against the scroll: while
+      // scrolling forward, only consider frames at or ahead of what's
+      // already shown (and vice versa). Otherwise a gap in what's loaded
+      // makes the cake visibly jump backwards mid-scroll.
+      const forward = target >= drawn;
+      for (let d = 0; d <= NEAREST_FRAME_SEARCH; d++) {
+        const ahead = target + d;
+        if (ahead < FRAME_COUNT && state[ahead] === 2 && (!forward || ahead >= drawn)) {
+          if (ahead !== drawn && drawFrameRef.current(ahead)) drawnFrameRef.current = ahead;
+          return;
         }
-        await Promise.all(batch);
+        if (d === 0) continue;
+        const behind = target - d;
+        if (behind >= 0 && state[behind] === 2 && (forward ? behind >= drawn : behind <= drawn)) {
+          if (behind !== drawn && drawFrameRef.current(behind)) drawnFrameRef.current = behind;
+          return;
+        }
       }
     }
 
-    run();
+    // Keep the window around the current target filled and drop the rest.
+    // Nearest-first ordering matters more than raw throughput here: on a
+    // fast flick the target moves constantly, and what must win is the
+    // frame currently on screen, not the 40 the scroll already passed.
+    function pump() {
+      if (cancelled) return;
+      const target = targetFrameRef.current;
+
+      const keepLo = Math.max(0, target - WINDOW_BEHIND - WINDOW_RELEASE_MARGIN);
+      const keepHi = Math.min(FRAME_COUNT - 1, target + WINDOW_AHEAD + WINDOW_RELEASE_MARGIN);
+      for (let i = 0; i < FRAME_COUNT; i++) {
+        if (i < keepLo || i > keepHi) release(i);
+      }
+
+      for (let d = 0; d <= WINDOW_AHEAD; d++) {
+        if (inFlight >= MAX_CONCURRENT_LOADS) return;
+        const ahead = target + d;
+        if (ahead < FRAME_COUNT) startLoad(ahead);
+        if (d === 0) continue;
+        if (inFlight >= MAX_CONCURRENT_LOADS) return;
+        const behind = target - d;
+        if (d <= WINDOW_BEHIND && behind >= 0) startLoad(behind);
+      }
+    }
+
+    requestFrameWindowRef.current = () => {
+      paintBestAvailable();
+      pump();
+    };
+
+    imagesRef.current = images as HTMLImageElement[];
+    // Gate the hero on just the resting frame, then let the window fill in
+    // behind it (startLoad's finish() flips imagesReady and pumps).
+    startLoad(0);
+
     return () => {
       cancelled = true;
-      if (priorityImg) priorityImg.src = "data:,";
+      for (let i = 0; i < FRAME_COUNT; i++) release(i);
     };
   }, []);
 
@@ -354,8 +413,14 @@ export default function ScrollCakeHero() {
       hero.checkpoints.forEach((cp, i) => {
         const els = checkpointEls[i];
         if (!els.length) return;
-        const next = hero.checkpoints[i + 1]?.progress ?? 1.02;
-        const inRange = progress >= cp.progress && progress < next - 0.02;
+        const next = hero.checkpoints[i + 1]?.progress ?? Infinity;
+        // Contiguous ranges — no gap between one checkpoint ending and the
+        // next beginning. An earlier `next - 0.02` left a dead band where
+        // no heading was shown at all, so stopping the scroll inside it
+        // (~2% of the pin, twice over) left the hero with no headline.
+        // The 0.3s tween already crossfades out/in, so nothing is gained
+        // by also blanking the overlap.
+        const inRange = progress >= cp.progress && progress < next;
         const targetOpacity = inRange ? 1 : 0;
         if (Number(els[0].dataset.targetOpacity) === targetOpacity) return;
         els.forEach((el) => {
@@ -388,17 +453,15 @@ export default function ScrollCakeHero() {
           FRAME_COUNT - 1,
           Math.floor(self.progress * FRAME_COUNT)
         );
+        const movedFrame = frame !== targetFrameRef.current;
         targetFrameRef.current = frame;
         if (frame !== drawnFrameRef.current) {
-          if (drawFrame(frame)) {
-            drawnFrameRef.current = frame;
-          } else {
-            // This frame's image isn't loaded yet. Fetch it directly
-            // instead of waiting for the background queue to reach it —
-            // on a fast scroll that queue could be 100+ frames behind.
-            ensureFrameLoadingRef.current(frame);
-          }
+          if (drawFrame(frame)) drawnFrameRef.current = frame;
         }
+        // Re-centre the load window on where the scroll actually is, and
+        // fall back to the nearest loaded frame if this one hasn't landed
+        // yet, so the hero keeps tracking the scroll instead of freezing.
+        if (movedFrame) requestFrameWindowRef.current();
         syncCheckpoints(self.progress);
       },
     });
@@ -417,7 +480,7 @@ export default function ScrollCakeHero() {
         if (drawFrame(targetFrameRef.current)) {
           drawnFrameRef.current = targetFrameRef.current;
         } else {
-          ensureFrameLoadingRef.current(targetFrameRef.current);
+          requestFrameWindowRef.current();
         }
       });
     };
