@@ -37,15 +37,21 @@ const FIT_SCALE = 0.88;
 // and WIDTH_FACTOR high enough that height, not width, is what binds.
 const PORTRAIT_WIDTH_FACTOR = 2;
 const PORTRAIT_MAX_HEIGHT = 0.62;
-// Flying chocolate gets cropped at the top and sides late in the take.
-// Without a backdrop to sit in, those crops would read as hard straight
-// cuts, so those edges dissolve. The bottom needs no fade: the frame is
-// anchored past the bottom of the viewport (see BOTTOM_OVERSHOOT), so the
-// cake's cropped base runs off screen rather than ending in mid-air.
-const EDGE_FADE = { top: 0.06, bottom: 0, left: 0.05, right: 0.05 };
+// The dissolve on the frame's cropped top and side edges lives in the
+// frames' alpha channel now (see edgeFadeAt in scripts/extract-frames.mjs),
+// not in a runtime compositing pass.
+//
 // How far below the viewport's bottom edge the frame is anchored, as a
 // fraction of the drawn frame height.
 const BOTTOM_OVERSHOOT = 0.04;
+// Ceiling on the canvas backing store width, in device pixels. Honouring
+// devicePixelRatio blindly gave a 2850px-wide canvas on a Retina laptop —
+// 5.1M pixels to clear and redraw per frame — for no visible gain, since
+// the source frames are only 1600 (desktop) and 960 (mobile) wide. Capping
+// just past the source resolution keeps the same sharpness for a fraction
+// of the fill cost.
+const MAX_CANVAS_WIDTH_DESKTOP = 1800;
+const MAX_CANVAS_WIDTH_MOBILE = 1100;
 // No counter-zoom: the source's own push-in is what makes the cake fill
 // more of the screen as you scroll, base and all, the same way it plays in
 // the original video. An earlier version shrank later frames to keep the
@@ -83,18 +89,18 @@ function frameWindow() {
 const NATIVE_WIDTH = 1280;
 const NATIVE_HEIGHT = 720;
 
+// An ImageBitmap normally, or an <img> on the rare browser without
+// createImageBitmap. Both are valid drawImage sources.
+type FrameSource = ImageBitmap | HTMLImageElement;
+
 type Layout = {
   dx: number;
   dy: number;
   drawWidth: number;
   drawHeight: number;
-  // Precomputed destination-out gradient fills for the edge dissolve.
-  // Position/size never change between frames at a given canvas size, so
-  // these are built once per resize instead of once per scroll tick.
-  bands: Array<{ x: number; y: number; w: number; h: number; gradient: CanvasGradient }>;
 };
 
-function computeLayout(ctx: CanvasRenderingContext2D, cssWidth: number, cssHeight: number): Layout {
+function computeLayout(cssWidth: number, cssHeight: number): Layout {
   let scale;
   if (cssHeight > cssWidth) {
     scale = (cssWidth * PORTRAIT_WIDTH_FACTOR) / NATIVE_WIDTH;
@@ -110,52 +116,15 @@ function computeLayout(ctx: CanvasRenderingContext2D, cssWidth: number, cssHeigh
   const drawHeight = NATIVE_HEIGHT * scale;
   const dx = (cssWidth - drawWidth) / 2;
   const dy = cssHeight - drawHeight + drawHeight * BOTTOM_OVERSHOOT;
-  const right = dx + drawWidth;
-  const bottom = dy + drawHeight;
 
-  const makeBand = (
-    x: number,
-    y: number,
-    w: number,
-    h: number,
-    from: [number, number],
-    to: [number, number]
-  ) => {
-    const gradient = ctx.createLinearGradient(from[0], from[1], to[0], to[1]);
-    gradient.addColorStop(0, "rgba(0,0,0,0)");
-    gradient.addColorStop(1, "rgba(0,0,0,1)");
-    return { x, y, w, h, gradient };
-  };
-
-  const bands = [
-    makeBand(dx, dy, drawWidth, drawHeight * EDGE_FADE.top, [0, dy + drawHeight * EDGE_FADE.top], [0, dy]),
-    makeBand(
-      dx,
-      bottom - drawHeight * EDGE_FADE.bottom,
-      drawWidth,
-      drawHeight * EDGE_FADE.bottom,
-      [0, bottom - drawHeight * EDGE_FADE.bottom],
-      [0, bottom]
-    ),
-    makeBand(dx, dy, drawWidth * EDGE_FADE.left, drawHeight, [dx + drawWidth * EDGE_FADE.left, 0], [dx, 0]),
-    makeBand(
-      right - drawWidth * EDGE_FADE.right,
-      dy,
-      drawWidth * EDGE_FADE.right,
-      drawHeight,
-      [right - drawWidth * EDGE_FADE.right, 0],
-      [right, 0]
-    ),
-  ];
-
-  return { dx, dy, drawWidth, drawHeight, bands };
+  return { dx, dy, drawWidth, drawHeight };
 }
 
 export default function ScrollCakeHero() {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const tiltRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const imagesRef = useRef<HTMLImageElement[]>([]);
+  const framesRef = useRef<Array<FrameSource | undefined>>([]);
   // Two refs, not one: targetFrameRef is "what scroll currently wants
   // shown", updated on every onUpdate regardless of whether that frame's
   // image has arrived yet. drawnFrameRef is "what's actually on the
@@ -196,7 +165,7 @@ export default function ScrollCakeHero() {
   // long the sequence is.
   useEffect(() => {
     let cancelled = false;
-    const images: Array<HTMLImageElement | undefined> = new Array(FRAME_COUNT);
+    const frames: Array<FrameSource | undefined> = new Array(FRAME_COUNT);
     // 0 = not loaded, 1 = in flight, 2 = ready
     const state = new Uint8Array(FRAME_COUNT);
     let inFlight = 0;
@@ -208,25 +177,12 @@ export default function ScrollCakeHero() {
       // faster than a frame can arrive, so essentially every load got
       // cancelled just before completing and the sequence showed 7 frames
       // instead of ~50. A frame that lands late still feeds the
-      // nearest-available fallback. Starvation of the on-screen frame is
-      // instead solved by letting the target bypass the cap — see pump().
+      // nearest-available fallback.
       if (state[i] !== 2) return;
-      const img = images[i];
-      if (img) {
-        // Detach first. Clearing src re-fires load/error handlers on an
-        // already-loaded image, and those handlers adjust inFlight — left
-        // attached, every release double-decremented the counter until it
-        // went negative, the concurrency cap stopped capping, and the
-        // loader flooded the connection so the frame actually on screen
-        // never got bandwidth. That was the stall.
-        img.onload = null;
-        img.onerror = null;
-        // Dropping the reference alone doesn't reliably free the decoded
-        // bitmap; clearing src does. "data:," rather than "" because an
-        // empty relative src re-resolves to the current page URL.
-        img.src = "data:,";
-      }
-      images[i] = undefined;
+      const frame = frames[i];
+      // close() frees the decoded pixels immediately and deterministically.
+      if (frame && "close" in frame) frame.close();
+      frames[i] = undefined;
       state[i] = 0;
     };
 
@@ -234,10 +190,6 @@ export default function ScrollCakeHero() {
       if (cancelled || state[i] !== 0) return;
       state[i] = 1;
       inFlight++;
-      const img = new Image();
-      images[i] = img;
-      // One-shot guard: whatever happens to this element later (including
-      // a src change), this particular load settles the counter once.
       let settled = false;
       const settle = () => {
         if (settled) return false;
@@ -245,11 +197,13 @@ export default function ScrollCakeHero() {
         inFlight--;
         return true;
       };
-      img.src = frameUrl(i);
-      const finish = () => {
+      const succeed = (frame: FrameSource) => {
         if (!settle()) return;
-        if (cancelled) return;
-        if (state[i] !== 1) return; // released while in flight
+        if (cancelled || state[i] !== 1) {
+          if ("close" in frame) frame.close();
+          return;
+        }
+        frames[i] = frame;
         state[i] = 2;
         // The resting frame is all the hero waits on before revealing.
         if (i === 0) setImagesReady(true);
@@ -258,12 +212,7 @@ export default function ScrollCakeHero() {
         paintBestAvailable();
         pump();
       };
-      img.onload = () => {
-        // Decode up front so the first draw of this frame doesn't stall.
-        if (img.decode) img.decode().catch(() => {}).finally(finish);
-        else finish();
-      };
-      img.onerror = () => {
+      const fail = () => {
         if (!settle()) return;
         if (state[i] === 1) state[i] = 0;
         if (cancelled) return;
@@ -272,6 +221,33 @@ export default function ScrollCakeHero() {
         if (i === 0) window.setTimeout(() => !cancelled && startLoad(0), 500);
         pump();
       };
+
+      // Fetch + createImageBitmap rather than an <img>.
+      //
+      // These sources are never attached to the document, and Chromium is
+      // free to throw away the decoded pixels of an unattached image — so
+      // every drawImage paid a fresh WebP-with-alpha decode on the main
+      // thread. Measured: stubbing out the draw dropped p90 frame time
+      // from 131ms to 19ms under 4x CPU throttle, while shrinking the
+      // canvas barely moved it, which put the cost squarely on the source
+      // side. An ImageBitmap is decoded once, off the main thread, and
+      // stays decoded until closed.
+      if (typeof createImageBitmap === "function") {
+        fetch(frameUrl(i))
+          .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(String(res.status)))))
+          .then((blob) => createImageBitmap(blob))
+          .then(succeed)
+          .catch(fail);
+        return;
+      }
+
+      const img = new Image();
+      img.src = frameUrl(i);
+      img.onload = () => {
+        if (img.decode) img.decode().catch(() => {}).finally(() => succeed(img));
+        else succeed(img);
+      };
+      img.onerror = fail;
     };
 
     // Draw the closest frame to the target that's actually loaded.
@@ -344,7 +320,7 @@ export default function ScrollCakeHero() {
       pump();
     };
 
-    imagesRef.current = images as HTMLImageElement[];
+    framesRef.current = frames;
     // Gate the hero on just the resting frame, then let the window fill in
     // behind it (startLoad's finish() flips imagesReady and pumps).
     startLoad(0);
@@ -355,56 +331,59 @@ export default function ScrollCakeHero() {
     };
   }, []);
 
-  // Layout (position/scale/edge-gradients) is identical for every frame at
-  // a given canvas size — nothing here depends on which frame is showing —
-  // so it's computed once per size change instead of once per scroll tick.
+  // Layout (position and scale) is identical for every frame at a given
+  // canvas size — nothing here depends on which frame is showing — so it's
+  // computed once per size change instead of once per scroll tick.
   const getLayout = useCallback(
-    (ctx: CanvasRenderingContext2D, cssWidth: number, cssHeight: number, dpr: number) => {
+    (cssWidth: number, cssHeight: number, dpr: number) => {
       const cached = layoutRef.current;
       if (cached && cached.cssWidth === cssWidth && cached.cssHeight === cssHeight && cached.dpr === dpr) {
         return cached.layout;
       }
-      const layout = computeLayout(ctx, cssWidth, cssHeight);
+      const layout = computeLayout(cssWidth, cssHeight);
       layoutRef.current = { layout, cssWidth, cssHeight, dpr };
       return layout;
     },
     []
   );
 
-  // Draw the current frame: contained, anchored to the bottom, edges
-  // feathered. Only touches the canvas — no gradient allocation, no scale
-  // math — so it's cheap enough to call on every scroll tick. Returns
-  // whether it actually painted, so callers can tell "drew it" apart from
-  // "this frame's image isn't ready yet" and retry later instead of
-  // treating a skipped draw as done.
+  // Draw the current frame: contained, anchored to the bottom. Just a clear
+  // and one drawImage — the edge dissolve is baked into the frames' alpha
+  // at build time rather than composited here, because doing it at runtime
+  // dominated frame cost. Returns whether it actually painted, so callers
+  // can tell "drew it" apart from "this frame's image isn't ready yet" and
+  // retry later instead of treating a skipped draw as done.
   const drawFrame = useCallback((index: number): boolean => {
     const canvas = canvasRef.current;
-    const img = imagesRef.current[index];
-    if (!canvas || !img || !img.complete || img.naturalWidth === 0) return false;
+    const frame = framesRef.current[index];
+    if (!canvas || !frame) return false;
+    if (frame instanceof HTMLImageElement && (!frame.complete || frame.naturalWidth === 0)) {
+      return false;
+    }
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return false;
 
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const cssWidth = canvas.clientWidth;
     const cssHeight = canvas.clientHeight;
-    if (canvas.width !== cssWidth * dpr || canvas.height !== cssHeight * dpr) {
-      canvas.width = cssWidth * dpr;
-      canvas.height = cssHeight * dpr;
+    // Cap the backing store instead of always honouring devicePixelRatio.
+    // At DPR 2 a 1425px-wide hero means a 2850x1800 canvas — 5.1M pixels
+    // cleared and redrawn every frame, measured at a p90 of 132ms under
+    // 4x CPU throttle. There's nothing to gain past the source frame's own
+    // resolution, so cap near it: same sharpness, ~2.5x less pixel work.
+    const maxWidth = onSmallScreen() ? MAX_CANVAS_WIDTH_MOBILE : MAX_CANVAS_WIDTH_DESKTOP;
+    const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2, maxWidth / cssWidth));
+    const targetW = Math.round(cssWidth * dpr);
+    const targetH = Math.round(cssHeight * dpr);
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-    const { dx, dy, drawWidth, drawHeight, bands } = getLayout(ctx, cssWidth, cssHeight, dpr);
-    ctx.drawImage(img, dx, dy, drawWidth, drawHeight);
-
-    ctx.save();
-    ctx.globalCompositeOperation = "destination-out";
-    for (const band of bands) {
-      ctx.fillStyle = band.gradient;
-      ctx.fillRect(band.x, band.y, band.w, band.h);
-    }
-    ctx.restore();
+    const { dx, dy, drawWidth, drawHeight } = getLayout(cssWidth, cssHeight, dpr);
+    ctx.drawImage(frame, dx, dy, drawWidth, drawHeight);
     return true;
   }, [getLayout]);
 

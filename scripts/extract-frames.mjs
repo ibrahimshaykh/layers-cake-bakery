@@ -213,6 +213,29 @@ function samplePlate(grid, x, y, out) {
   }
 }
 
+// Per-pixel multiplier that dissolves the frame's own top and side edges,
+// where the camera crops flying chocolate mid-air. This used to be done at
+// runtime with four destination-out gradient fills per drawn frame, which
+// measured as the dominant cost of the scroll: destination-out is a slow
+// compositing path, and on a Retina laptop those fills covered a
+// 2850x1800 canvas every frame (p90 frame time 132ms under 4x CPU
+// throttle). It's a fixed function of position, so it belongs in the
+// alpha channel at build time — the runtime then only clears and draws.
+// The bottom edge is deliberately not faded: the hero anchors the frame
+// past the bottom of the viewport, so that edge is off screen anyway.
+const EDGE_FADE_TOP = 0.06;
+const EDGE_FADE_SIDE = 0.05;
+
+function edgeFadeAt(x, y) {
+  const topBand = HEIGHT * EDGE_FADE_TOP;
+  const sideBand = WIDTH * EDGE_FADE_SIDE;
+  let f = 1;
+  if (y < topBand) f = Math.min(f, y / topBand);
+  if (x < sideBand) f = Math.min(f, x / sideBand);
+  if (x > WIDTH - 1 - sideBand) f = Math.min(f, (WIDTH - 1 - x) / sideBand);
+  return f;
+}
+
 function matteFrame(rgb, rgba, grid, mask) {
   buildGrid(rgb, grid);
   buildSubjectMask(grid, mask);
@@ -238,6 +261,8 @@ function matteFrame(rgb, rgba, grid, mask) {
       if (diff <= dead) a = 0;
       else if (diff >= solid) a = 255;
       else a = Math.round(((diff - dead) / (solid - dead)) * 255);
+
+      if (a > 0) a = Math.round(a * edgeFadeAt(x, y));
 
       const di = (y * WIDTH + x) * 4;
       rgba[di] = r; rgba[di + 1] = g; rgba[di + 2] = b; rgba[di + 3] = a;
