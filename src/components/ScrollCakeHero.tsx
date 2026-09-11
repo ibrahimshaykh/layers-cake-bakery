@@ -418,8 +418,26 @@ export default function ScrollCakeHero() {
     // cleared and redrawn every frame, measured at a p90 of 132ms under
     // 4x CPU throttle. There's nothing to gain past the source frame's own
     // resolution, so cap near it: same sharpness, ~2.5x less pixel work.
+    //
+    // The cap is a true ceiling, not a floor at 1. It used to be wrapped in
+    // Math.max(1, ...), which meant it only ever bit on high-DPR screens —
+    // on a large monitor, where devicePixelRatio is 1, it did nothing at all
+    // and the canvas became the full CSS size: 3825x2160 on a 4K display,
+    // 8.3M pixels to clear and redraw per frame.
+    //
+    // Measure that with a plain rAF timer and it looks free, because at that
+    // viewport the browser's own compositing saturates the frame budget
+    // either way (an rAF p90 of ~117ms with the cake drawn, stubbed out, or
+    // the canvas display:none'd alike). Timing the clear+draw pair itself,
+    // flushed, is what shows the real cost: median 100ms uncapped vs 24ms
+    // capped, a 4.2x difference in work this component actually does.
+    //
+    // Going below 1 costs no real detail — the frames only hold 1600px of
+    // it, so an 1800px canvas still carries every pixel the source has, and
+    // the browser scales the canvas up to fill the display. Compared
+    // side by side at 2560 the two are indistinguishable.
     const maxWidth = onSmallScreen() ? MAX_CANVAS_WIDTH_MOBILE : MAX_CANVAS_WIDTH_DESKTOP;
-    const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2, maxWidth / cssWidth));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2, maxWidth / cssWidth);
     const targetW = Math.round(cssWidth * dpr);
     const targetH = Math.round(cssHeight * dpr);
     if (canvas.width !== targetW || canvas.height !== targetH) {
