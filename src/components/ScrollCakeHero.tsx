@@ -9,22 +9,32 @@ import { hero } from "@/content/site";
 // rather than 150 because the scroll outran loading at 150 — see the
 // comment there for the measurements.
 const FRAME_COUNT = 80;
-// The decode window (see the loader effect for the full reasoning). These
-// bound how much *decoded* bitmap is resident: roughly
-// (AHEAD + BEHIND + 2*MARGIN) frames, each costing width*height*4 bytes.
-// Hence a profile per set — a resident frame costs 5.8MB at 1600x900 and
-// 2.1MB at 960x540, so the phone can't hold as many.
-//   desktop: ~32 frames * 5.8MB ~= 185MB
-//   mobile:  ~27 frames * 2.1MB ~=  56MB
-// AHEAD applies in whichever direction the scroll is travelling, so
-// scrolling up gets the same runway as scrolling down. MARGIN is
-// hysteresis, so frames at the window edge aren't dropped and re-decoded
-// repeatedly as the scroll jitters.
-const WINDOW_DESKTOP = { ahead: 14, behind: 6, margin: 6 };
-const WINDOW_MOBILE = { ahead: 12, behind: 5, margin: 5 };
+// The decode window (see the loader effect for the full reasoning).
+//
+// AHEAD/BEHIND set how far decoding *leads* and *trails* the scroll, in
+// whichever direction it's travelling. Retention is symmetric at
+// (AHEAD + MARGIN) either side, so turning around always lands on frames
+// that are still decoded — an asymmetric keep-range was what made
+// reversing stutter. MARGIN is also hysteresis, so frames at the edge
+// aren't dropped and re-decoded as the scroll jitters.
+//
+// That retention is the memory bound: (2*(AHEAD+MARGIN)+1) frames, each
+// costing width*height*4 bytes decoded — 5.8MB at 1600x900, 2.1MB at
+// 960x540. So ~35 frames means ~200MB desktop, ~72MB mobile.
+const WINDOW_DESKTOP = { ahead: 12, behind: 8, margin: 5 };
+const WINDOW_MOBILE = { ahead: 12, behind: 8, margin: 5 };
 // Decodes are off-thread and cheap next to a network round trip, so this
-// can be higher than the old network concurrency was.
+// can run wider than the old network concurrency did. Raising it to 16
+// was tried and measured no better on a reversal (the bottleneck is total
+// decode work, not parallelism), so it stays here.
 const MAX_CONCURRENT_DECODES = 8;
+// Decode the desktop set slightly smaller than its stored 1600px. Decode
+// cost scales with output pixels, and a reversal has to rebuild a stretch
+// of frames at once — that was the one case still stalling. The canvas
+// draws the frame at roughly 1580 device px on a Retina laptop, so this
+// is a ~1.2x upscale, far less than the ~2x the original 1280 set had.
+// The phone set is already small enough to decode natively.
+const DECODE_WIDTH_DESKTOP = 1280;
 // How many frames' bytes to fetch in parallel while filling the byte cache.
 const FETCH_CONCURRENCY = 10;
 // How far from the wanted frame to look for an already-decoded one to show
@@ -257,7 +267,14 @@ export default function ScrollCakeHero() {
       // pixels Chromium is free to discard, making every drawImage pay a
       // fresh WebP-with-alpha decode.
       if (typeof createImageBitmap === "function") {
-        createImageBitmap(blobs[i] as Blob).then(succeed).catch(fail);
+        const opts = onSmallScreen()
+          ? undefined
+          : {
+              resizeWidth: DECODE_WIDTH_DESKTOP,
+              resizeHeight: Math.round((DECODE_WIDTH_DESKTOP * NATIVE_HEIGHT) / NATIVE_WIDTH),
+              resizeQuality: "high" as const,
+            };
+        createImageBitmap(blobs[i] as Blob, opts).then(succeed).catch(fail);
         return;
       }
       const img = new Image();
@@ -277,30 +294,40 @@ export default function ScrollCakeHero() {
       };
     };
 
-    // Keep the decode window filled in the direction of travel, and drop
-    // what's outside it.
+    // Decode *order* leads in the direction of travel, but what's kept is
+    // symmetric around the scroll.
+    //
+    // Those are deliberately different. An asymmetric keep-range is what
+    // made reversing worse: with 14 frames retained ahead and only 6
+    // behind, the instant you turned around your runway was those 6, and
+    // everything else had to be decoded from scratch while the scroll was
+    // already moving. Measured on desktop, reversing immediately after a
+    // pass down: worst stall 11 rAFs (~180ms) against 5 (~80ms) going
+    // down. Keeping the same distance either side means a reversal finds
+    // frames already decoded, at the cost of holding a few more.
     function pumpDecode() {
       if (cancelled) return;
       const target = targetFrameRef.current;
       const win = frameWindow();
-      const ahead = direction >= 0 ? win.ahead : win.behind;
-      const behind = direction >= 0 ? win.behind : win.ahead;
+      const keep = win.ahead + win.margin;
 
-      const keepLo = Math.max(0, target - behind - win.margin);
-      const keepHi = Math.min(FRAME_COUNT - 1, target + ahead + win.margin);
+      const keepLo = Math.max(0, target - keep);
+      const keepHi = Math.min(FRAME_COUNT - 1, target + keep);
       for (let i = 0; i < FRAME_COUNT; i++) {
         if (i < keepLo || i > keepHi) release(i);
       }
 
-      const reach = Math.max(ahead, behind);
-      for (let d = 0; d <= reach; d++) {
+      // Lead in the direction of travel; trail behind it.
+      const lead = win.ahead;
+      const trail = win.behind;
+      for (let d = 0; d <= Math.max(lead, trail); d++) {
         if (decoding >= MAX_CONCURRENT_DECODES) return;
         const fwd = target + (direction >= 0 ? d : -d);
-        if (d <= ahead && fwd >= 0 && fwd < FRAME_COUNT) startDecode(fwd);
+        if (d <= lead && fwd >= 0 && fwd < FRAME_COUNT) startDecode(fwd);
         if (d === 0) continue;
         if (decoding >= MAX_CONCURRENT_DECODES) return;
         const back = target - (direction >= 0 ? d : -d);
-        if (d <= behind && back >= 0 && back < FRAME_COUNT) startDecode(back);
+        if (d <= trail && back >= 0 && back < FRAME_COUNT) startDecode(back);
       }
     }
 
