@@ -34,6 +34,23 @@ const MAX_CONCURRENT_DECODES = 8;
 // draws the frame at roughly 1580 device px on a Retina laptop, so this
 // is a ~1.2x upscale, far less than the ~2x the original 1280 set had.
 // The phone set is already small enough to decode natively.
+//
+// The resample runs at "low" quality, and that is not a corner cut — it is
+// most of the decode budget. Benchmarked on the desktop set at 2x CPU
+// throttle, 12 frames, per frame and then all 12 in parallel:
+//
+//   native (1600x900, no resize)   44.9ms    234ms
+//   1280, resizeQuality low        64.7ms    302ms
+//   1280, resizeQuality medium    155.3ms      —
+//   1280, resizeQuality high      157.3ms   1318ms
+//
+// "high" cost 3.5x native to produce a *smaller* frame, and it was the
+// reason a hard flick took most of a second to catch up. Cropped side by
+// side against "high" at 1920, the result is indistinguishable.
+//
+// Decoding natively is cheaper still, but a 1600x900 frame is 5.8MB
+// decoded against 3.7MB, and that extra churn measurably costs ordinary
+// scrolling. 1280 at "low" is the point where both are cheap.
 const DECODE_WIDTH_DESKTOP = 1280;
 // How many frames' bytes to fetch in parallel while filling the byte cache.
 const FETCH_CONCURRENCY = 10;
@@ -233,6 +250,26 @@ export default function ScrollCakeHero() {
       }
     }
 
+    // A frame landing is not a reason to repaint on its own.
+    //
+    // Several decodes can complete between two screen refreshes, and each
+    // one used to repaint immediately. A single draw costs ~31ms at 1580px
+    // under 2x CPU throttle, so three arrivals in one refresh spent ~90ms
+    // drawing frames that were replaced before any of them were displayed —
+    // time the next scroll update needed. That is why decoding faster made
+    // ordinary scrolling *worse*: quicker arrivals meant more wasted draws.
+    //
+    // So a newly arrived frame only repaints if it is actually closer to
+    // what the scroll wants than whatever is already on the canvas.
+    const paintOnArrival = (i: number) => {
+      const drawn = drawnFrameRef.current;
+      if (drawn >= 0) {
+        const target = targetFrameRef.current;
+        if (Math.abs(i - target) >= Math.abs(drawn - target)) return;
+      }
+      paintBestAvailable();
+    };
+
     const startDecode = (i: number) => {
       if (cancelled || state[i] !== 0 || !blobs[i]) return;
       state[i] = 1;
@@ -253,7 +290,7 @@ export default function ScrollCakeHero() {
         frames[i] = frame;
         state[i] = 2;
         if (i === 0) setImagesReady(true);
-        paintBestAvailable();
+        paintOnArrival(i);
         pumpDecode();
       };
       const fail = () => {
@@ -272,7 +309,7 @@ export default function ScrollCakeHero() {
           : {
               resizeWidth: DECODE_WIDTH_DESKTOP,
               resizeHeight: Math.round((DECODE_WIDTH_DESKTOP * NATIVE_HEIGHT) / NATIVE_WIDTH),
-              resizeQuality: "high" as const,
+              resizeQuality: "low" as const,
             };
         createImageBitmap(blobs[i] as Blob, opts).then(succeed).catch(fail);
         return;
